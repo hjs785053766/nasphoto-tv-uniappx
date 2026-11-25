@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <script>
+      var coverSupport =
+        'CSS' in window &&
+        typeof CSS.supports === 'function' &&
+        (CSS.supports('top: env(a)') || CSS.supports('top: constant(a)'))
+      document.write(
+        '<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,minimum-scale=1.0,user-scalable=no' +
+          (coverSupport ? ',viewport-fit=cover' : '') +
+          '" />'
+      )
+    </script>
+    <style>
+      /**
+       * uni-app x 在 web 端把 rpx 编译成 rem（1rpx = 1/32 rem），
+       * 必须让 750rpx 等于视口宽度：根字号 = 100vw / 23.4375。
+       * 用 !important 压住运行时写入的 font-size。
+       */
+      html {
+        font-size: calc(100vw / 23.4375) !important;
+      }
+    </style>
+    <title>NasPhotoTV</title>
+    <!--preload-links-->
+    <!--app-context-->
+  </head>
+  <body>
+    <div id="app"><!--app-html--></div>
+    <script type="module" src="/main.ts"></script>
+  </body>
+</html>

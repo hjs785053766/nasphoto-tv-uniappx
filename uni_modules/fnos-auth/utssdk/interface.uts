@@ -1,0 +1,298 @@
+/**
+ * fnos-auth 插件对外暴露的类型声明。
+ *
+ * 说明：为了避开 UTS / Kotlin 之间的复杂类型映射，插件对外只接受基础类型参数
+ * （string / number / boolean），结果以结构化对象返回；内部的网络与加密实现
+ * 全部在 app-android 目录的 Kotlin 混编代码里。
+ */
+
+/** 登录结果 */
+export type FnOsLoginResult = {
+  /** 是否已拿到 AccessToken */
+  ok: boolean
+  /** 密码正确，但需要再输一次动态验证码（此时 ok=false，会话仍在服务端挂着） */
+  need2fa: boolean
+  /** 成功后才有值：后续所有业务请求的 AccessToken */
+  token: string
+  /** 服务端下发的会话 secret（保留字段，业务接口实际只用到 token） */
+  secret: string
+  /** 失败原因（中文，可直接展示） */
+  error: string
+}
+
+/** 相册统计结果（用来验证 token 是否真的可用） */
+export type FnOsStatResult = {
+  ok: boolean
+  need2fa: boolean
+  photoCount: number
+  videoCount: number
+  error: string
+}
+
+/** 本地保存的连接配置（密码用于冷启动自动重登，注意安全边界） */
+export type FnOsSavedConfig = {
+  saved: boolean
+  host: string
+  port: number
+  /** true = HTTPS（默认 5667）；false = 纯 HTTP（默认 5666） */
+  https: boolean
+  username: string
+  password: string
+  accessCode: string
+}
+
+/**
+ * 当前登录用户（`GET /p/api/v1/user/info`）。
+ *
+ * 设置页的「当前状态」用它验证 token 是否真的还有效：
+ * 只看 `getToken()` 非空不可靠（跨夜 / NAS 改密码后 token 可能已失效）。
+ * 未登录或 token 失效时 `ok=false`，`error` 带原因（可能为空）。
+ */
+export type FnOsUserInfo = {
+  ok: boolean
+  /** 用户名（`data.name`），未登录时为空 */
+  name: string
+  /** 是否管理员 */
+  isAdmin: boolean
+  /** NAS 用户 id（`data.id`） */
+  id: number
+  error: string
+}
+
+/** 时间轴上的一个年份：offset = 该年第一张照片在整个图库里的下标 */
+export type FnOsYear = {
+  year: number
+  offset: number
+}
+
+/** 时间轴上的一个月份：offset = 该月第一张照片在整个图库里的下标 */
+export type FnOsMonth = {
+  year: number
+  month: number
+  offset: number
+}
+
+/** 图库时间轴（服务端按天聚合，这里压缩成「年 + 月」两级） */
+export type FnOsTimeline = {
+  ok: boolean
+  total: number
+  years: Array<FnOsYear>
+  /** 按年、月倒序；用于时间轴展开该年的月份列表 */
+  months: Array<FnOsMonth>
+  error: string
+}
+
+/** 一张照片/视频（字段已精简，够网格展示用） */
+export type FnOsPhoto = {
+  id: string
+  /** "2026:11:02 17:27:09" */
+  dt: string
+  /** photo / video */
+  cat: string
+  w: number
+  h: number
+  /** 实况照片 */
+  live: boolean
+  /** 网格缩略图（服务端 s，约 15KB） */
+  thumb: string
+  /** 中等尺寸（服务端 s，约 15KB）：查看器先出这张，再换原图 */
+  medium: string
+  /** 原图（originalUrl；服务端没有时退化到 lUrl/mUrl，可能为空） */
+  original: string
+  /** 原文件名（服务端可能不返回，为空时页面从路径里兜底） */
+  name: string
+  /** 实况照片的动态片段 / 视频流地址 */
+  video: string
+  /** 视频时长（秒），照片恒为 0；网格角标显示用 */
+  duration: number
+}
+
+/** 一页图库 */
+export type FnOsPhotoPage = {
+  ok: boolean
+  items: Array<FnOsPhoto>
+  error: string
+}
+
+/**
+ * AI 搜索结果（`POST /p/api/v1/magic-search/do`，请求体 `{"keyword":"海边","antiFilters":[]}`）。
+ *
+ * 列表项和图库同构（id / dt / cat / live / thumb / original / video / duration），
+ * 所以大屏搜索页的网格、角标、查看器全部复用图库那一套。
+ */
+export type FnOsSearchResult = {
+  ok: boolean
+  items: Array<FnOsPhoto>
+  /** 服务端给的总数；没给时是本次返回的条数 */
+  total: number
+  error: string
+}
+
+/** 相册列表项（`album/list` 一项，相册页用） */
+export type FnOsAlbum = {
+  /** albumId；服务端没给时为 0 */
+  id: number
+  /** 相册名，如 2026-01-05-翠湖 */
+  name: string
+  /** 照片 + 视频总数 */
+  count: number
+  /** 是否已共享 */
+  shared: boolean
+  /** 封面图路径（形如 /p/api/v1/stream/p/t/{posterUpId}/s/{posterUUID}），空表示没有封面 */
+  cover: string
+  /** 相册类型：1 = 宝宝相册（实测只有它；普通相册为 0），用来画封面角标 */
+  category: number
+  /** 封面时间对应的「2026年1月」，无时间时为空（相册页暂未按月份分组，留给后续） */
+  month: string
+  /** 相册起始时间原文（形如 "2026-01-05 10:00:00"），排序兜底用 */
+  start: string
+}
+
+/**
+ * 智能场景分类（`ai-smart-rec/categories?mainCategory=scene` 的一项）。
+ *
+ * 服务端返回 `{name, itemCount, poster:{photoId, uuid}}`，海报流地址由
+ * `poster` 拼成 `/p/api/v1/stream/p/t/{photoId}/{size}/{uuid}`：
+ * m 尺寸（1280 宽，约 150KB）给首页大屏背景，s 尺寸（240×320，约 15KB）给卡片封面。
+ */
+export type FnOsSmartCategory = {
+  /** 分类名，如「夜景」「海滩」 */
+  name: string
+  /** 该分类下的照片 + 视频数量 */
+  count: number
+  /** 大屏背景图路径（m 尺寸），空表示没有海报 */
+  cover: string
+  /** 卡片封面路径（s 尺寸），空表示没有海报 */
+  thumb: string
+}
+
+/** 智能场景分类列表 */
+export type FnOsSmartCategoryPage = {
+  ok: boolean
+  items: Array<FnOsSmartCategory>
+  error: string
+}
+
+/** 一页相册 */
+export type FnOsAlbumPage = {
+  ok: boolean
+  items: Array<FnOsAlbum>
+  /** 服务端给的总数；没给时是本页条数 */
+  total: number
+  error: string
+}
+
+/** 单个相册的详情（`album/item`，相册内页的头部信息） */
+export type FnOsAlbumDetail = {
+  ok: boolean
+  error: string
+  id: number
+  name: string
+  photoCount: number
+  videoCount: number
+  /** 封面图路径（s 尺寸流地址），空表示没有 */
+  cover: string
+  /** 相册内最早 / 最晚拍摄时间（"2025:12:13 05:43:43"），没有照片时为空 */
+  start: string
+  end: string
+  shared: boolean
+  /** 创建者昵称 */
+  owner: string
+}
+
+/** 照片所属相册（album/photo/belong 的摘要） */
+export type FnOsAlbumBrief = {
+  /** 相册名，如 2023-11-18-柳州 */
+  name: string
+  /** "2023年11月"（按相册开始时间） */
+  month: string
+  /** 照片 + 视频总数 */
+  count: number
+  /** 是否已共享 */
+  shared: boolean
+  /** 封面图路径（/p/api/v1/stream/p/t/{posterUpId}/xs/{posterUUID}），空表示没有 */
+  cover: string
+}
+
+/** 照片中的人物（ai-person/personInPhoto 的摘要） */
+export type FnOsPersonBrief = {
+  /** 人物名字 */
+  name: string
+  /** 头像路径（/p/api/v1/stream/face/{faceId}），空表示取不到 */
+  avatar: string
+}
+
+/**
+ * 照片详情（`gallery/getOne` + 相册 / 人物）。
+ * size / 相机 / 曝光参数已在插件里格式化成可直接展示的文本，页面用之前判断非空即可。
+ */
+export type FnOsPhotoDetail = {
+  ok: boolean
+  error: string
+  /** 原文件名，如 IMG_5295.HEIC */
+  fileName: string
+  /** NAS 上的完整路径 */
+  filePath: string
+  /** "2.03 MB"；服务端没给时为空 */
+  fileSize: string
+  /** "7.2MP" */
+  mp: string
+  width: number
+  height: number
+  /** 拍摄时间（服务端 photoDateTime，格式未固定） */
+  dateTime: string
+  /** "Apple iPhone 14" */
+  camera: string
+  /** "f/1.5" */
+  aperture: string
+  /** "1/3704s" */
+  exposure: string
+  /** "ISO50" */
+  iso: string
+  /** "5.7mm" */
+  focal: string
+  /** 地址名（如「中国,广西壮族自治区,北海市,海城区,涠洲岛」），空表示没有地理信息 */
+  geo: string
+  /** 0 表示没有 GPS */
+  latitude: number
+  longitude: number
+  /** 所属相册（可能多个，也可能为空） */
+  albums: Array<FnOsAlbumBrief>
+  /** 照片中的人物（可能多个，也可能为空） */
+  persons: Array<FnOsPersonBrief>
+  description: string
+}
+
+/**
+ * 视频的一档清晰度（fnOS `video/decode/info` 的 `quality[]` 一项）。
+ * `resolution` 是字符串（"1080" / "720"），`bitrate` 为 0 表示这是原始画质。
+ */
+export type FnOsVideoQuality = {
+  resolution: string
+  bitrate: number
+  progressive: boolean
+}
+
+export type FnOsVideoInfo = {
+  ok: boolean
+  error: string
+  qualities: Array<FnOsVideoQuality>
+  /** 源视频编码宽度（`data.videoStreamInfo[0].width`，未旋转） */
+  sourceWidth: number
+  /** 源视频编码高度（未旋转） */
+  sourceHeight: number
+  /**
+   * 源视频的旋转角（FFmpeg 约定，实测竖屏手机视频是 `-90`）。
+   *
+   * NAS 的转码流（HLS/TS）**不带旋转信息**，竖屏源会被转成横向画面（内容躺倒），
+   * 所以只有转码链路需要拿这个值在客户端补旋转；原画是 mp4 容器，ExoPlayer 自己会转。
+   */
+  rotation: number
+}
+
+export type FnOsVideoPlay = {
+  ok: boolean
+  /** 可直接给 <video src> 的相对路径（`/p/api/v1/video/decode/stream?...`） */
+  path: string
+  error: string
+}

@@ -1,0 +1,17 @@
+buildscript {
+    dependencies {
+        // 这 3 个 jar 来自 uni-app x 原生 SDK 的 plugins 目录（已拷贝到本项目 plugins/）
+        classpath(files('plugins/uts-kotlin-compiler-plugin-0.0.1.jar'))
+        classpath(files('plugins/uts-kotlin-gradle-plugin-0.0.1.jar'))
+        // 仅蒸汽模式（Vapor）需要
+        classpath(files('plugins/auto-register-gradle-plugin-1.0.0.jar'))
+    }
+}
+
+plugins {
+    alias(libs.plugins.android.application) apply false
+    alias(libs.plugins.android.library) apply false
+    alias(libs.plugins.kotlin.android) apply false
+    // 仅蒸汽模式（Vapor）需要：auto-register 插件依赖 ksp
+    id 'com.google.devtools.ksp' version '2.3.11' apply false
+}

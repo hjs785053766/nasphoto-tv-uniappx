@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <application
+        android:name="io.dcloud.uniappxv.UniApplication"
+        android:allowBackup="true"
+        android:debuggable="false"
+        android:supportsRtl="true"
+        android:largeHeap="true"
+        tools:ignore="HardcodedDebugMode"
+        tools:replace="android:allowBackup">
+
+        <!-- uni-app x 的入口 Activity：这里直接挂 LAUNCHER，点开 App 即进入 uni-app x 页面 -->
+        <activity
+            android:name="io.dcloud.uniappxv.UniAppActivity"
+            android:configChanges="orientation|keyboardHidden|screenSize|mcc|mnc|fontScale|keyboard|smallestScreenSize|screenLayout|uiMode"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:theme="@style/Theme.AppCompat.DayNight.NoActionBar"
+            android:windowSoftInputMode="adjustResize"
+            tools:replace="android:label,android:exported,android:theme,android:configChanges,android:windowSoftInputMode">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- 应用 appid：必须和 HBuilderX 里项目的 appid 一致，打包脚本会自动替换 -->
+        <meta-data
+            android:name="DCLOUD_UNI_APPID"
+            android:value="__UNI__APPID__" />
+
+        <!-- 应用分发渠道：通过 uni.getAppBaseInfo() 可读取 -->
+        <meta-data
+            android:name="DCLOUD_CHANNEL"
+            android:value="default" />
+    </application>
+</manifest>

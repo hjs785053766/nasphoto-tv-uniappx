@@ -1,0 +1,11 @@
+<script lang="uts">
+	export default {
+		onLaunch() {
+			console.log('NasPhotoTV(uni-app x) launch')
+		}
+	}
+</script>
+
+<style>
+	/* App 全局样式：页面里已经用 page 根节点铺满，这里只保留最小设置 */
+</style>

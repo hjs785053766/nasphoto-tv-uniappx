@@ -1,0 +1,73 @@
+<template>
+	<view class="thumb">
+		<!-- aspectFill：以中心为准填满格子，超出部分裁切（正方形网格的标准做法） -->
+		<image v-if="src.length > 0" class="img" :src="src" mode="aspectFill" @error="onError" />
+		<view v-else class="placeholder">
+			<text class="placeholder-text">·</text>
+		</view>
+	</view>
+</template>
+
+<script setup lang="uts">
+	import { thumb } from '@/uni_modules/fnos-auth'
+
+	const props = defineProps<{
+		path: string
+	}>()
+
+	const src = ref('')
+	const triedFileUri = ref(false)
+
+	function load() {
+		const p: string = props.path
+		if (p.length == 0) {
+			return
+		}
+		thumb(p).then((local: string) => {
+			if (local.length > 0) {
+				src.value = local
+			}
+		})
+	}
+
+	/**
+	 * 个别 ROM 上 <image> 只认 file:// URI，加载失败时补一次前缀重试。
+	 */
+	function onError() {
+		// #ifdef APP-ANDROID
+		if (!triedFileUri.value && src.value.length > 0) {
+			triedFileUri.value = true
+			src.value = 'file://' + src.value
+		}
+		// #endif
+	}
+
+	onMounted(() => {
+		load()
+	})
+</script>
+
+<style>
+	.thumb {
+		width: 100%;
+		height: 100%;
+		background-color: #1E1E21;
+	}
+
+	/* <image> 默认尺寸是 320x240，不显式给宽高会在格子里溢出/偏移 */
+	.img {
+		width: 100%;
+		height: 100%;
+	}
+
+	.placeholder {
+		flex: 1;
+		align-items: center;
+		justify-content: center;
+	}
+
+	.placeholder-text {
+		font-size: 20rpx;
+		color: #303030;
+	}
+</style>

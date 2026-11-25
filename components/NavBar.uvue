@@ -1,0 +1,388 @@
+<template>
+	<view class="navbar">
+		<!-- 左：品牌 + 分区标签，整块一个半透明胶囊（悬浮在内容之上，不压暗背景） -->
+		<view class="brand">
+			<!-- 品牌图标：官方 logo（static/logo-128.png，24rpx≈60px 足够；原图 466KB 只做母版） -->
+			<image class="nav-logo" src="/static/logo-128.png" mode="aspectFit" />
+			<text class="brand-title">NAS 相册</text>
+			<view class="entries" v-if="!compact">
+				<view class="entry" :class="tabClass(i)" v-for="(t, i) in NAV_TABS" :key="t" @click="onNavClick(i)">
+					<text class="entry-text" :class="tabTextClass(i)">{{ t }}</text>
+				</view>
+			</view>
+		</view>
+
+		<!-- 右：搜索 / 设置 / 实时时间，各自一个小胶囊 -->
+		<view class="right">
+			<view class="act" :class="actClass(3)" v-if="showSearch" @click="onSearchClick">
+				<view class="ico-search">
+					<view class="ico-search-ring" :class="searchActive || focusIndex == 3 ? 'ico-ring-on' : ''"></view>
+					<view class="ico-search-handle" :class="searchActive || focusIndex == 3 ? 'ico-handle-on' : ''"></view>
+				</view>
+				<text class="act-text" :class="actTextClass(3)" v-if="!compact">搜索</text>
+			</view>
+			<view class="act" :class="actClass(4)" v-if="showSettings" @click="onSettingsClick">
+				<text class="ico-gear" :class="settingsActive || focusIndex == 4 ? 'ico-on' : ''">⚙</text>
+				<text class="act-text" :class="actTextClass(4)" v-if="!compact">设置</text>
+			</view>
+			<view class="clock" v-if="showClock">
+				<text class="clock-text">{{ clockText }}</text>
+			</view>
+		</view>
+	</view>
+</template>
+
+<script setup lang="uts">
+	/**
+	 * 全局导航栏（首页 / 图库 / 相册共用，唯一实现）。
+	 *
+	 * 视觉以首页大屏为准：**悬浮在页面最顶部**（position: absolute，不占布局高度），
+	 * 左侧「品牌 + 分区标签」一个半透明胶囊，右侧「搜索 / 设置 / 时间」小胶囊。
+	 * 因为不占位，使用方要在模板里紧跟一个等高的占位 view（见各页 `.nav-spacer`）。
+	 *
+	 * 组件只管渲染与点击，不做跳转：分区点击 emit `nav(index)`，
+	 * 搜索 / 设置分别 emit `search` / `settings`，由页面处理。
+	 * 遥控器焦点由页面通过 `focusIndex` 传入（-1 = 无焦点），组件不订阅按键。
+	 */
+	const props = defineProps<{
+		/** 当前分区：0 = 首页，1 = 图库，2 = 相册 */
+		active: number
+		/**
+		 * 遥控器焦点所在入口下标（-1 = 无焦点）；只影响描边，不影响选中实底。
+		 * 0 = 首页，1 = 图库，2 = 相册，3 = 搜索，4 = 设置（首页把五个入口串成一条焦点链）。
+		 */
+		focusIndex: number
+		showSearch: boolean
+		showSettings: boolean
+		showClock: boolean
+		/** 「设置」按钮是否高亮（设置页里为 true，与分区选中同一套蓝底样式） */
+		settingsActive: boolean
+		/** 「搜索」按钮是否高亮（搜索页里为 true，表示当前就在搜索） */
+		searchActive: boolean
+	}>()
+
+	const emit = defineEmits<{
+		(e: 'nav', index: number): void
+		(e: 'search'): void
+		(e: 'settings'): void
+	}>()
+
+	/** 分区标签：所有页面共用同一份，`active` 决定高亮项 */
+	const NAV_TABS: Array<string> = ['首页', '图库', '相册']
+
+	/** 窄屏（手机竖屏）：收起文字只留图标，避免一排按钮挤出屏幕 */
+	const compact = ref(false)
+	const clockText = ref('')
+
+	let clockTimer = 0
+
+	function pad2(n: number): string {
+		return n < 10 ? '0' + n.toString() : n.toString()
+	}
+
+	/** 12 小时制「下午 1:16」（与首页示例一致，不含秒） */
+	function updateClock() {
+		const d = new Date()
+		const h24 = d.getHours()
+		let h = h24 % 12
+		if (h == 0) {
+			h = 12
+		}
+		const ampm = h24 < 12 ? '上午' : '下午'
+		clockText.value = ampm + ' ' + h.toString() + ':' + pad2(d.getMinutes())
+	}
+
+	function stopClock() {
+		if (clockTimer != 0) {
+			clearInterval(clockTimer)
+			clockTimer = 0
+		}
+	}
+
+	function startClock() {
+		updateClock()
+		stopClock()
+		clockTimer = setInterval(() => {
+			updateClock()
+		}, 1000)
+	}
+
+	function tabClass(i: number): string {
+		let cls = ''
+		if (i == props.active) {
+			cls = 'entry-on'
+		}
+		if (i == props.focusIndex) {
+			if (cls.length > 0) {
+				// 焦点落在「已经是选中态」的那一项（首页盯住「首页」）：蓝描边会淹没在蓝实底里，
+				// 换成白描边，否则用户按上键会以为没反应
+				cls = 'entry-on entry-focus-on'
+			} else {
+				cls = 'entry-focus'
+			}
+		}
+		return cls
+	}
+
+	function tabTextClass(i: number): string {
+		return i == props.active || i == props.focusIndex ? 'entry-text-on' : ''
+	}
+
+	/** 右侧「搜索 / 设置」：3 = 搜索，4 = 设置。选中蓝实底、焦点蓝描边，与分区标签同一套规则 */
+	function actClass(i: number): string {
+		let on = false
+		if (i == 3) {
+			on = props.searchActive
+		} else if (i == 4) {
+			on = props.settingsActive
+		}
+		let cls = on ? 'act act-on' : 'act'
+		if (i == props.focusIndex) {
+			// 与分区标签同理：选中蓝实底 + 蓝描边看不出焦点，改用白描边
+			cls = on ? 'act act-on act-focus-on' : 'act act-focus'
+		}
+		return cls
+	}
+
+	function actTextClass(i: number): string {
+		let on = false
+		if (i == 3) {
+			on = props.searchActive
+		} else if (i == 4) {
+			on = props.settingsActive
+		}
+		return on || i == props.focusIndex ? 'act-text-on' : ''
+	}
+
+	function onNavClick(i: number) {
+		emit('nav', i)
+	}
+
+	function onSearchClick() {
+		emit('search')
+	}
+
+	function onSettingsClick() {
+		emit('settings')
+	}
+
+	onMounted(() => {
+		compact.value = uni.getWindowInfo().windowWidth < 600.0
+		startClock()
+	})
+
+	onUnmounted(() => {
+		stopClock()
+	})
+</script>
+
+<style>
+	/* 悬浮在页面顶部：不占布局高度，背景照片保持原亮度。
+	   z-index 必须给：页面里紧跟的 `.nav-spacer` 在文档流中位于本组件之后，
+	   会把整条导航栏盖住、吃掉所有点击（web 实测 elementFromPoint 命中的就是 spacer）。 */
+	.navbar {
+		position: absolute;
+		left: 16rpx;
+		right: 16rpx;
+		top: 12rpx;
+		z-index: 10;
+		flex-direction: row;
+		align-items: center;
+		justify-content: space-between;
+	}
+
+	/* ---------------- 左：品牌 + 分区标签 ---------------- */
+
+	.brand {
+		height: 30rpx;
+		flex-direction: row;
+		align-items: center;
+		padding-left: 9rpx;
+		padding-right: 6rpx;
+		border-radius: 15rpx;
+		background-color: rgba(0, 0, 0, 0.42);
+	}
+
+	/* 品牌图标：官方 logo（static/logo.png，方形 741×741），aspectFit 保证不裁切 */
+	.nav-logo {
+		width: 24rpx;
+		height: 24rpx;
+	}
+
+	.brand-title {
+		font-size: 17rpx;
+		font-weight: bold;
+		color: #FFFFFF;
+		margin-left: 8rpx;
+	}
+
+	.entries {
+		flex-direction: row;
+		align-items: center;
+		margin-left: 14rpx;
+	}
+
+	/* 边框统一 2rpx：焦点只改颜色不改宽度，否则会「撑开尺寸→整条导航栏位移」 */
+	.entry {
+		height: 24rpx;
+		flex-direction: row;
+		align-items: center;
+		justify-content: center;
+		margin-right: 6rpx;
+		padding-left: 10rpx;
+		padding-right: 10rpx;
+		border-radius: 12rpx;
+		background-color: rgba(255, 255, 255, 0.14);
+		border-width: 2rpx;
+		border-style: solid;
+		border-color: rgba(255, 255, 255, 0.16);
+	}
+
+	/* 当前分区：蓝色实底（与「每行张数」档位同色） */
+	.entry-on {
+		background-color: #3388FF;
+		border-color: #3388FF;
+	}
+
+	/* 遥控器焦点：蓝描边 + 提亮底色（TV 距离下 1rpx 描边根本看不出来） */
+	.entry-focus {
+		border-color: #6FB0FF;
+		background-color: rgba(51, 136, 255, 0.34);
+	}
+
+	/* 焦点落在选中项上（首页的分区恒亮）：蓝描边看不见，改白描边（必须写在本条之后） */
+	.entry-focus-on {
+		border-color: #FFFFFF;
+	}
+
+	.entry-text {
+		font-size: 10rpx;
+		color: #DEDEE2;
+	}
+
+	.entry-text-on {
+		color: #FFFFFF;
+		font-weight: bold;
+	}
+
+	/* ---------------- 右：搜索 / 设置 / 时间 ---------------- */
+
+	.right {
+		flex-direction: row;
+		align-items: center;
+	}
+
+	.act {
+		height: 26rpx;
+		flex-direction: row;
+		align-items: center;
+		justify-content: center;
+		margin-left: 6rpx;
+		padding-left: 9rpx;
+		padding-right: 9rpx;
+		border-radius: 13rpx;
+		background-color: rgba(0, 0, 0, 0.42);
+		border-width: 2rpx;
+		border-style: solid;
+		border-color: rgba(255, 255, 255, 0.12);
+	}
+
+	/* 当前所在页对应入口（目前的设置页）：蓝底白字，与分区选中态一致 */
+	.act-on {
+		background-color: #3388FF;
+		border-color: #3388FF;
+	}
+
+	/* 遥控器焦点：蓝描边 + 提亮底色，与分区标签的 .entry-focus 同一套表达 */
+	.act-focus {
+		border-color: #6FB0FF;
+		background-color: rgba(51, 136, 255, 0.34);
+	}
+
+	.act-focus-on {
+		border-color: #FFFFFF;
+	}
+
+	.act-text {
+		font-size: 10rpx;
+		color: #E4E4E8;
+		margin-left: 4rpx;
+	}
+
+	.act-text-on {
+		color: #FFFFFF;
+		font-weight: bold;
+	}
+
+	.ico-on {
+		color: #FFFFFF;
+	}
+
+	/* 搜索图标：圆环 + 45° 斜手柄（app-android 支持 transform: rotate） */
+	.ico-search {
+		width: 12rpx;
+		height: 12rpx;
+		position: relative;
+	}
+
+	.ico-search-ring {
+		position: absolute;
+		left: 0;
+		top: 0;
+		width: 9rpx;
+		height: 9rpx;
+		border-width: 2rpx;
+		border-style: solid;
+		border-color: #D8D8DC;
+		border-radius: 5rpx;
+	}
+
+	.ico-search-handle {
+		position: absolute;
+		left: 7rpx;
+		top: 7rpx;
+		width: 2rpx;
+		height: 5rpx;
+		border-radius: 1rpx;
+		background-color: #D8D8DC;
+		transform: rotate(-45deg);
+		transform-origin: 50% 50%;
+	}
+
+	/* 搜索按钮选中态（搜索页）：圆环只换**描边色**、手柄只换**填充色**，各用一个类。
+	   曾经把两个属性写在同一个 `.ico-search-on` 里：圆环被填成实心白块（放大镜变成一个圆球），
+	   用户当场指出「搜索图标不对」—— 改的时候不要合并回一个类。 */
+	.ico-ring-on {
+		border-color: #FFFFFF;
+	}
+
+	.ico-handle-on {
+		background-color: #FFFFFF;
+	}
+
+	/* 设置图标：齿轮字形 */
+	.ico-gear {
+		font-size: 11rpx;
+		color: #D8D8DC;
+	}
+
+	.clock {
+		height: 26rpx;
+		flex-direction: row;
+		align-items: center;
+		justify-content: center;
+		margin-left: 6rpx;
+		padding-left: 12rpx;
+		padding-right: 12rpx;
+		border-radius: 13rpx;
+		background-color: rgba(0, 0, 0, 0.5);
+		border-width: 1rpx;
+		border-style: solid;
+		border-color: rgba(255, 255, 255, 0.14);
+	}
+
+	.clock-text {
+		font-size: 13rpx;
+		color: #FFFFFF;
+	}
+</style>

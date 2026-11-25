@@ -1,0 +1,76 @@
+plugins {
+    alias(libs.plugins.android.library)
+    id 'io.dcloud.uts.kotlin'
+    // Vapor mode only
+    id 'io.dcloud.uts.auto-register'
+}
+
+android {
+    namespace 'io.dcloud.uniappx.offline'
+    compileSdk { version = release(36) }
+
+    defaultConfig {
+        minSdk 23
+    }
+
+    buildTypes {
+        release {
+            optimization {
+                enable false
+            }
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    androidResources {
+        noCompress "uni-app-x-framework-vapor", "uni-app-x-framework-vapor-dev", "js"
+        ignoreAssetsPattern '!.svn:!.git:.*:!CVS:!thumbs.db:!picasa.ini:!*.scc:*~'
+    }
+
+    aaptOptions {
+        additionalParameters '--auto-add-overlay'
+        ignoreAssetsPattern '!.svn:!.git:.*:!CVS:!thumbs.db:!picasa.ini:!*.scc:*~'
+    }
+
+    packagingOptions {
+        pickFirst 'lib/*/libstlport_shared.so'
+        pickFirst 'lib/*/libc++_shared.so'
+        jniLibs {
+            useLegacyPackaging false
+        }
+    }
+}
+
+dependencies {
+    implementation fileTree(include: ['*.aar'], dir: 'libs')
+
+    implementation "androidx.tracing:tracing-ktx:1.3.0"
+    implementation "androidx.core:core-ktx:1.10.1"
+    implementation "androidx.appcompat:appcompat:1.6.1"
+    implementation "androidx.constraintlayout:constraintlayout:2.2.1"
+    implementation "androidx.exifinterface:exifinterface:1.3.6"
+    implementation "com.google.android.material:material:1.10.0"
+
+    implementation "org.jetbrains.kotlin:kotlin-reflect:2.2.0"
+    implementation "org.jetbrains.kotlinx:kotlinx-coroutines-core:1.7.3"
+    implementation "org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3"
+
+    implementation "com.facebook.fresco:fresco:3.4.0"
+    implementation "com.facebook.fresco:animated-base:3.4.0"
+    implementation "com.facebook.fresco:animated-gif:3.4.0"
+    implementation "com.facebook.fresco:animated-webp:3.4.0"
+    implementation "com.facebook.fresco:webpsupport:3.4.0"
+    implementation "com.facebook.fresco:imagepipeline:3.4.0"
+    implementation "com.facebook.fresco:drawee:3.4.0"
+    implementation "com.facebook.fresco:middleware:3.4.0"
+
+    implementation "com.caverock:androidsvg:1.4"
+    implementation "com.alibaba:fastjson:1.2.83"
+    implementation "com.github.getActivity:XXPermissions:18.63"
+    implementation "androidx.profileinstaller:profileinstaller:1.4.1"
+    implementation "com.squareup.okhttp3:okhttp:3.12.12"
+}

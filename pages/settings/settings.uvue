@@ -1,0 +1,1009 @@
+<template>
+	<view class="page">
+		<!-- 全局导航栏（与其他页面共用 components/NavBar.uvue），设置页不属于任何分区（active = -1） -->
+		<NavBar
+			:active="-1"
+			:focus-index="navIndex"
+			:show-search="true"
+			:show-settings="true"
+			:show-clock="true"
+			:settings-active="true"
+			:search-active="false"
+			@nav="onNavClick"
+			@search="onOpenSearch"
+			@settings="onOpenSettings"
+		/>
+		<view class="nav-spacer"></view>
+
+		<!-- 左右布局（3 : 7）：左选项、右内容 -->
+		<view class="main">
+			<view class="side">
+				<view class="opt" :class="optClass(i)" v-for="(t, i) in TABS" :key="t" @click="onTabClick(i)">
+					<text class="opt-text" :class="optTextClass(i)">{{ t }}</text>
+				</view>
+			</view>
+
+			<view class="panel">
+				<text class="panel-title">{{ TABS[tabIndex] }}</text>
+
+				<!-- 1. 登录状态 -->
+				<view class="rows" v-if="tabIndex == 0">
+					<view class="row" v-for="r in infoRows" :key="r.label">
+						<text class="row-label">{{ r.label }}</text>
+						<text class="row-value">{{ r.value }}</text>
+					</view>
+					<!-- 退出登录居中：外层用 row + justify-content: center，按钮宽度固定 -->
+					<view class="danger-wrap">
+						<view class="danger" :class="dangerClass()" @click="onLogoutKey">
+							<text class="danger-text" :class="dangerTextClass()">{{ logoutText }}</text>
+						</view>
+					</view>
+				</view>
+
+				<!-- 3. 视频清晰度（T4.6，2026-11-24 扩到六档）：单选，存 `fnos.video.quality`，
+				     查看器每次打开视频时读一次 → 设置后对之后打开的视频全局生效。
+				     档位与码率上限全在 common/video.uts，这里只按 qualityOptions 渲染。
+				     最后一行是 T4.8 的 HEVC 转 H.264 兼容开关（存 `fnos.video.hevc`，默认关闭） -->
+				<view class="rows" v-else-if="tabIndex == 2">
+					<view
+						class="q-row"
+						:class="qualityRowClass(i)"
+						v-for="(q, i) in qualityOptions"
+						:key="q.value"
+						@click="onQualityClick(i)"
+					>
+						<view class="q-main">
+							<text class="q-label">{{ q.label }}</text>
+							<text class="q-desc">{{ q.desc }}</text>
+						</view>
+						<text class="q-check" v-if="q.value == quality">✓</text>
+					</view>
+
+					<!-- T4.8：HEVC（H.265）转 H.264 兼容开关。默认关闭 = 行为与以前一致；
+					     开启后「原画放不出来」的视频会让 NAS 转一份 H.264 从当前进度续播 -->
+					<view class="q-row q-row-switch" :class="hevcRowClass()" @click="onHevcClick">
+						<view class="q-main">
+							<text class="q-label">HEVC 转 H.264（兼容模式）</text>
+							<text class="q-desc">{{ hevcDesc }}</text>
+						</view>
+						<view class="q-switch" :class="hevcOn ? 'q-switch-on' : ''">
+							<text class="q-switch-text" :class="hevcOn ? 'q-switch-text-on' : ''">{{ hevcOn ? '已开启' : '已关闭' }}</text>
+						</view>
+					</view>
+
+					<text class="q-note">{{ qualityNote }}</text>
+				</view>
+
+				<!-- 5. 按键诊断（正式包在电视上看不到 logcat，这里把最近按键画在屏幕上）。
+				     只显示最近 12 条、**不用 scroll-view**：以前用 flex:1 的 scroll-view，
+				     记录一多就把下面的「清空记录」顶出屏幕（用户报「按多次后看不到清空按钮」） -->
+				<view class="rows" v-else-if="tabIndex == 4">
+					<text class="diag-hint">最近 12 次按键（最新在最上面）。`→ 层名` = 这层吃掉了键；`→ none` = 没有任何层认领（多半是漏写 return false）。</text>
+					<view class="diag-list">
+						<text class="diag-line" v-for="(ln, i) in traceRows" :key="i">{{ ln }}</text>
+						<text class="diag-empty" v-if="traceRows.length == 0">还没有按键记录</text>
+					</view>
+					<view class="danger-wrap">
+						<view class="danger" :class="dangerClass()" @click="clearTraces">
+							<text class="danger-text" :class="dangerTextClass()">清空记录</text>
+						</view>
+					</view>
+				</view>
+
+				<!-- 2 / 3 暂未开放 -->
+				<view class="empty" v-else>
+					<text class="empty-text">暂未开放</text>
+					<text class="empty-sub">{{ placeholderHint }}</text>
+				</view>
+			</view>
+		</view>
+	</view>
+</template>
+
+<script setup lang="uts">
+	import { getSavedConfig, userInfo, logout, startTvKeyHook, stopTvKeyHook } from '@/uni_modules/fnos-auth'
+	import NavBar from '@/components/NavBar.uvue'
+	import {
+		VIDEO_QUALITY_KEY,
+		VIDEO_QUALITY_DEFAULT,
+		VIDEO_HEVC_KEY,
+		VIDEO_HEVC_DEFAULT,
+		VIDEO_HEVC_ON,
+		VIDEO_HEVC_OFF,
+		normalizeVideoQuality,
+		normalizeHevcCompat,
+		videoQualityOptions
+	} from '@/common/video.uts'
+	import { KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_OK, KEY_ENTER, KEY_BACK, dispatchKey, keyTraces, clearKeyTraces } from '@/common/keys.uts'
+
+	/** 右侧一行信息：标签 + 值 */
+	type SettingsRow = {
+		label: string
+		value: string
+	}
+
+	/**
+	 * 左侧选项：登录状态 / 视频清晰度已做，首页展示设置（T4.5）与主题设置（T4.7）仍占位。
+	 *
+	 * 最后一项「按键诊断」是给**电视正式包**用的：那边看不到 logcat，
+	 * 这里把最近的按键轨迹（谁吃掉了这个键）画在屏幕上，用遥控器就能读出来。
+	 */
+	const TABS: Array<string> = ['登录状态', '首页展示设置', '视频清晰度', '主题设置', '按键诊断']
+
+	/** 焦点区域：0 = 左侧选项，1 = 右侧内容（登录状态的「退出登录」/ 视频清晰度的三档） */
+	const focusArea = ref(0)
+	/** 右栏内的焦点行号（退出登录只有一行；视频清晰度是三档 + HEVC 开关 = 四行） */
+	const focusRow = ref(0)
+	/** 当前选中的选项下标 */
+	const tabIndex = ref(0)
+
+	/**
+	 * 导航栏遥控器焦点（-1 = 不在导航栏）。
+	 * 左栏第一项再按上 → 进导航栏（与其它页面同一套焦点链）；导航栏里返回才离开设置页。
+	 */
+	const navIndex = ref(-1)
+	/** 导航栏可聚焦入口个数：0 首页 / 1 图库 / 2 相册 / 3 搜索 / 4 设置 */
+	const NAV_COUNT = 5
+
+	/** 视频清晰度三档（原图 / 标清 / 低清），顺序即右栏从上到下 */
+	const qualityOptions = videoQualityOptions()
+	/** 当前档位：默认标清（用户要求），onShow 时按 storage 刷新 */
+	const quality = ref(VIDEO_QUALITY_DEFAULT)
+	/**
+	 * HEVC 兼容开关（T4.8）：`on` / `off`，默认关闭。
+	 * 与清晰度同在「视频清晰度」这一栏，作为第 4 行（qualityOptions.length 之后）。
+	 */
+	const hevcMode = ref(VIDEO_HEVC_DEFAULT)
+	/** 退出登录的二次确认（避免遥控器误触直接退出） */
+	const exitArmed = ref(false)
+	/** 登录信息行（每次 onShow 重新读一次本地配置 + 请求一次 user/info） */
+	const infoRows = ref<Array<SettingsRow>>([])
+	/** 「按键诊断」栏的内容：每行 `mm:ss 页面 按键 → 命中层`（最新在最上面） */
+	const traceRows = ref<Array<string>>([])
+
+	// 连接配置（来自 getSavedConfig，onShow 刷新）
+	const cfgHost = ref('')
+	const cfgPort = ref('')
+	const cfgUser = ref('')
+	const cfgHasPwd = ref(false)
+	const cfgHttps = ref(false)
+	/** 本地是否保存过连接配置（没保存过时各项显示 —，避免露默认值） */
+	const cfgSaved = ref(false)
+	/** token 是否有效：以 `user/info` 的返回为准，而不是「token 非空」 */
+	const loggedIn = ref(false)
+	const checking = ref(false)
+
+	let keyHook = 0
+	/** 页面是否在前台：onShow 里那个「延迟重挂按键通道」的守卫 */
+	let pageVisible = false
+	/** 二次确认的自动复位定时器 */
+	let armTimer = 0
+
+	const logoutText = computed((): string => {
+		return exitArmed.value ? '再按一次确认退出' : '退出登录'
+	})
+
+	const placeholderHint = computed((): string => {
+		if (tabIndex.value == 1) {
+			return '首页展示内容（数据源 / 循环 / 展示时间）以后在这里改'
+		}
+		return '浅色 / 深色主题以后在这里改'
+	})
+
+	/**
+	 * 视频清晰度右栏底部的说明：浏览器播不了转码流，只保存选择。
+	 * 用「先给常量再按平台覆盖」的写法，不在 computed 里放 return（UTS 里两条 return 会被
+	 * 条件编译切掉一条，容易出「缺少 return」的编译报错）。
+	 */
+	let qualityNoteText = '对之后打开的视频生效（正在播放的不打断）；原图 = 直出原文件不转码；NAS转码原画 = 源分辨率但码率封顶 20M。'
+	// #ifdef WEB
+	qualityNoteText = '浏览器播不了 NAS 的转码流（HLS），这里只保存选择；实际生效在 App（Android TV）端。'
+	// #endif
+	const qualityNote = ref(qualityNoteText)
+
+	/** HEVC 兼容开关的说明文案（开关状态由右侧胶囊显示，这里只解释它做什么） */
+	let hevcDescText = '原画放不出来时（老电视 / 盒子不支持 H.265），让 NAS 转成 H.264 并从当前进度续播'
+	// #ifdef WEB
+	hevcDescText = '仅 App 生效：浏览器播不了 NAS 的转码流（HLS），这里只保存选择'
+	// #endif
+	const hevcDesc = ref(hevcDescText)
+
+	/** 开关是否开启（模板里只读这个布尔值，不在模板里调导入函数，见 AGENTS 5.2） */
+	const hevcOn = computed((): boolean => normalizeHevcCompat(hevcMode.value) == VIDEO_HEVC_ON)
+
+	/** 读档位：storage 只能存字符串，缺省 / 非法值回落标清（见 common/video.uts） */
+	function readQuality(): string {
+		const raw = uni.getStorageSync(VIDEO_QUALITY_KEY)
+		return normalizeVideoQuality(raw == null ? '' : raw.toString())
+	}
+
+	/** 读 HEVC 开关：缺省 / 非法值一律视为关闭（默认关闭，见 common/video.uts） */
+	function readHevcMode(): string {
+		const raw = uni.getStorageSync(VIDEO_HEVC_KEY)
+		return normalizeHevcCompat(raw == null ? '' : raw.toString())
+	}
+
+	/** 右栏可聚焦项数量（0 = 该选项还没做，右栏不可进）。清晰度页 = 三档 + HEVC 开关一行 */
+	function rightCount(): number {
+		if (tabIndex.value == 0) {
+			return 1
+		}
+		if (tabIndex.value == 2) {
+			return qualityOptions.length + 1
+		}
+		if (tabIndex.value == 4) {
+			// 按键诊断：只有「清空记录」一行可聚焦，其余是只读文本
+			return 1
+		}
+		return 0
+	}
+
+	/** 补两位 */
+	function pad2(n: number): string {
+		return n < 10 ? '0' + n.toString() : n.toString()
+	}
+
+	/** Date.now() → `hh:mm:ss`（纯算术，不依赖各平台的 Date 格式化 API） */
+	function timeText(ms: number): string {
+		const sec = Math.floor(ms / 1000) % 86400
+		const h = Math.floor(sec / 3600)
+		const m = Math.floor((sec % 3600) / 60)
+		return pad2(h) + ':' + pad2(m) + ':' + pad2(sec % 60)
+	}
+
+	/**
+	 * 刷新「按键诊断」栏（最新在最上面）。
+	 * 只在设置页可见时刷新，其它页面不产生任何渲染开销。
+	 */
+	function refreshTraces() {
+		const list = keyTraces()
+		// 只画最近 12 条：屏上区域固定，多了也看不全（完整 40 条仍在缓冲里，可用控制台/诊断排查）
+		const max = list.length < 12 ? list.length : 12
+		const rows: Array<string> = []
+		for (let i = 0; i < max; i++) {
+			const t = list[i]
+			rows.push(timeText(t.at) + '  ' + t.page + '  ' + t.key + ' → ' + (t.hit.length > 0 ? t.hit : 'none'))
+		}
+		traceRows.value = rows
+	}
+
+	/** 清空按键轨迹（右栏「清空记录」） */
+	function clearTraces() {
+		clearKeyTraces()
+		refreshTraces()
+	}
+
+	/** HEVC 开关行的下标（跟在三档后面） */
+	function hevcRowIndex(): number {
+		return qualityOptions.length
+	}
+
+	/** 清晰度行的样式：已选 = 蓝框，遥控器焦点 = 白框（白框定义在后面，同时命中时优先） */
+	function qualityRowClass(i: number): string {
+		let cls = 'q-row'
+		if (i >= 0 && i < qualityOptions.length && qualityOptions[i].value == quality.value) {
+			cls = cls + ' q-on'
+		}
+		if (focusArea.value == 1 && focusRow.value == i) {
+			cls = cls + ' q-focus'
+		}
+		return cls
+	}
+
+	/** HEVC 开关行的样式：开启 = 蓝框（同「已选」），遥控器焦点 = 白框 */
+	function hevcRowClass(): string {
+		let cls = 'q-row q-row-switch'
+		if (hevcOn.value) {
+			cls = cls + ' q-on'
+		}
+		if (focusArea.value == 1 && focusRow.value == hevcRowIndex()) {
+			cls = cls + ' q-focus'
+		}
+		return cls
+	}
+
+	/**
+	 * 切换 HEVC 兼容开关：立刻写 storage。
+	 * 查看器**每次打开视频时读一次**，所以对下一张视频生效，正在播的不打断（同清晰度档位）。
+	 */
+	function toggleHevc() {
+		hevcMode.value = hevcOn.value ? VIDEO_HEVC_OFF : VIDEO_HEVC_ON
+		uni.setStorageSync(VIDEO_HEVC_KEY, hevcMode.value)
+	}
+
+	/** 点 HEVC 行：焦点移到该行并切换 */
+	function onHevcClick() {
+		focusArea.value = 1
+		focusRow.value = hevcRowIndex()
+		toggleHevc()
+	}
+
+	/** 选中一档：立刻写 storage（查看器下一次打开视频时读到） */
+	function applyQuality(i: number) {
+		if (i < 0 || i >= qualityOptions.length) {
+			return
+		}
+		quality.value = qualityOptions[i].value
+		uni.setStorageSync(VIDEO_QUALITY_KEY, quality.value)
+	}
+
+	/** 当前档位在 qualityOptions 里的下标（找不到就回到第一行，避免越界） */
+	function selectedQualityIndex(): number {
+		for (let i = 0; i < qualityOptions.length; i++) {
+			if (qualityOptions[i].value == quality.value) {
+				return i
+			}
+		}
+		return 0
+	}
+
+	/** 点清晰度行：焦点移到该行并选中（鼠标 / 触屏路径） */
+	function onQualityClick(i: number) {
+		focusArea.value = 1
+		focusRow.value = i
+		applyQuality(i)
+	}
+
+	/** 用当前 ref 状态重建右侧信息行（登录状态那一行由 user/info 决定） */
+	function buildRows() {
+		let stateText = '未登录'
+		if (checking.value) {
+			stateText = '检测中…'
+		} else if (loggedIn.value) {
+			stateText = '已登录'
+		}
+		const rows: Array<SettingsRow> = []
+		rows.push({ label: '当前状态', value: stateText } as SettingsRow)
+		rows.push({ label: '服务器 IP', value: cfgHost.value.length > 0 ? cfgHost.value : '—' } as SettingsRow)
+		rows.push({ label: '服务器端口', value: cfgPort.value.length > 0 ? cfgPort.value : '—' } as SettingsRow)
+		rows.push({ label: '登录账号', value: cfgUser.value.length > 0 ? cfgUser.value : '—' } as SettingsRow)
+		// 密码只显示固定长度的掩码，不透露真实长度与字符
+		rows.push({ label: '登录密码', value: cfgHasPwd.value ? '********' : '—' } as SettingsRow)
+		rows.push({ label: 'HTTPS', value: cfgSaved.value ? (cfgHttps.value ? '是' : '否') : '—' } as SettingsRow)
+		infoRows.value = rows
+	}
+
+	/**
+	 * 刷新连接信息 + 验证token：
+	 * 登录状态以 `user/info`（`/p/api/v1/user/info`）的返回为准 —— 只看本地 token 是否非空
+	 * 不可靠（隔夜 / NAS 改密码后可能是失效串）。接口返回的 name 比本地保存的账号更权威。
+	 */
+	async function refreshLoginState() {
+		const cfg = getSavedConfig()
+		// 没有保存过配置时（例如 web 端直接访问本页）IP 也留空，避免显示 emptyConfig 的默认值
+		cfgSaved.value = cfg.saved
+		cfgHost.value = cfg.saved ? cfg.host : ''
+		cfgPort.value = cfg.saved ? cfg.port.toString() : ''
+		cfgUser.value = cfg.username
+		cfgHasPwd.value = cfg.password.length > 0
+		cfgHttps.value = cfg.https
+		checking.value = true
+		loggedIn.value = false
+		buildRows()
+		// userInfo 失败（断网 / token 失效）不能把整个 onShow 抛出去：
+		// 页面要保持可操作，只在「当前状态」那一行显示未登录
+		try {
+			const u = await userInfo()
+			loggedIn.value = u.ok
+			if (u.ok && u.name.length > 0) {
+				cfgUser.value = u.name
+			}
+		} catch (e) {
+			loggedIn.value = false
+			console.error('[settings] userInfo failed: ' + (e as Error).message)
+		}
+		checking.value = false
+		buildRows()
+	}
+
+	/**
+	 * 左栏选项样式：选中 = 蓝实底，遥控器焦点在左栏时再补一圈白描边。
+	 *
+	 * 以前只有「选中」没有「焦点」两种状态：焦点在左栏时界面完全没变化，
+	 * 用户以为设置页没反应（T5 之后用户反馈「设置页完全无法操作」）。
+	 */
+	function optClass(i: number): string {
+		let cls = i == tabIndex.value ? 'opt opt-on' : 'opt'
+		// 焦点在导航栏时不再画左栏白描边（避免两处都像“当前焦点”）
+		if (focusArea.value == 0 && i == tabIndex.value && navIndex.value < 0) {
+			cls = cls + ' opt-focus'
+		}
+		return cls
+	}
+
+	function optTextClass(i: number): string {
+		return i == tabIndex.value ? 'opt-text opt-text-on' : 'opt-text'
+	}
+
+	function dangerClass(): string {
+		return focusArea.value == 1 ? 'danger danger-focus' : 'danger'
+	}
+
+	function dangerTextClass(): string {
+		return focusArea.value == 1 ? 'danger-text danger-text-focus' : 'danger-text'
+	}
+
+	function resetArm() {
+		exitArmed.value = false
+		if (armTimer != 0) {
+			clearTimeout(armTimer)
+			armTimer = 0
+		}
+	}
+
+	/** 点选项：切换右侧内容，焦点回到左栏第一行 */
+	function onTabClick(i: number) {
+		tabIndex.value = i
+		focusArea.value = 0
+		focusRow.value = 0
+		resetArm()
+		if (i == 4) {
+			// 切到「按键诊断」时先抓一次现场
+			refreshTraces()
+		}
+	}
+
+	/** 退出登录：第一次只解锁，2.5 秒内再按一次才真正退出 */
+	function onLogoutKey() {
+		if (!exitArmed.value) {
+			exitArmed.value = true
+			if (armTimer != 0) {
+				clearTimeout(armTimer)
+			}
+			armTimer = setTimeout(() => {
+				exitArmed.value = false
+				armTimer = 0
+			}, 2500)
+			return
+		}
+		resetArm()
+		stopTvKeyHook(keyHook)
+		logout()
+		// 退出后回连接页，并阻止它用保存的账号密码自动重登
+		uni.setStorageSync('fnos.skipAuto', true)
+		uni.reLaunch({ url: '/pages/index/index' })
+	}
+
+	/** 导航栏分区：0 首页 / 1 图库 / 2 相册（设置页从这三页进来，统一用 reLaunch 回到根） */
+	function onNavClick(i: number) {
+		stopTvKeyHook(keyHook)
+		if (i == 0) {
+			uni.reLaunch({ url: '/pages/home/home' })
+		} else if (i == 1) {
+			uni.reLaunch({ url: '/pages/library/library' })
+		} else if (i == 2) {
+			uni.reLaunch({ url: '/pages/album/album' })
+		}
+	}
+
+	/** 导航栏「搜索」：进搜索页（navigateTo，返回键 / × 回设置页） */
+	function onOpenSearch() {
+		stopTvKeyHook(keyHook)
+		uni.navigateTo({ url: '/pages/search/search' })
+	}
+
+	/** 导航栏「设置」：当前就在设置页，不做跳转 */
+	function onOpenSettings() {
+	}
+
+	/**
+	 * 真正离开设置页。
+	 *
+	 * 一般情况回上一页；但如果是「首页 → 场景（搜索）→ 设置」这条链，
+	 * 用户期望**直接回首页**（2026-11-24 口径），不要再退回搜索页。
+	 * 标记由搜索页的场景入口写入（`fnos.scene.ret`）。
+	 */
+	function leavePage() {
+		stopTvKeyHook(keyHook)
+		const ret = uni.getStorageSync('fnos.scene.ret')
+		if (ret != null && ret.toString() == 'home') {
+			uni.removeStorageSync('fnos.scene.ret')
+			uni.reLaunch({ url: '/pages/home/home' })
+			return
+		}
+		uni.navigateBack({})
+	}
+
+	/** 返回键：右栏 → 左栏 → 退出回上一页 */
+	function onBack() {
+		if (focusArea.value == 1) {
+			focusArea.value = 0
+			resetArm()
+			return
+		}
+		leavePage()
+	}
+
+	/** 跳到导航栏第 i 个入口（0 首页 / 1 图库 / 2 相册 / 3 搜索 / 4 设置本页） */
+	function gotoNav(i: number) {
+		navIndex.value = -1
+		if (i == 3) {
+			onOpenSearch()
+		} else if (i == 0 || i == 1 || i == 2) {
+			onNavClick(i)
+		}
+		// i == 4 是当前页（设置），不重复跳
+	}
+
+	/**
+	 * 层「settings.nav」：导航栏焦点（栈顶）。
+	 * 左右在 5 个入口循环、OK 进入、下键回左栏、返回键离开设置页。
+	 */
+	function onNavKey(code: number): boolean {
+		if (code == KEY_LEFT) {
+			navIndex.value = (navIndex.value + NAV_COUNT - 1) % NAV_COUNT
+		} else if (code == KEY_RIGHT) {
+			navIndex.value = (navIndex.value + 1) % NAV_COUNT
+		} else if (code == KEY_OK || code == KEY_ENTER) {
+			gotoNav(navIndex.value)
+		} else if (code == KEY_DOWN) {
+			navIndex.value = -1
+		} else if (code == KEY_BACK) {
+			navIndex.value = -1
+			// 与左栏返回同一条路径（场景上下文直接回首页）
+			leavePage()
+		}
+		return true
+	}
+
+	/**
+	 * 进入右栏（右键 / 左栏 OK 都走这里）。
+	 * 清晰度页把焦点直接放到当前档位，避免一按 OK 就误改成别的档。
+	 */
+	function enterRight() {
+		if (rightCount() > 0) {
+			focusArea.value = 1
+			focusRow.value = tabIndex.value == 2 ? selectedQualityIndex() : 0
+		}
+	}
+
+	/**
+	 * 层「settings.right」：右栏的可聚焦内容（覆盖层）。
+	 * 上下在本栏内的行之间移动，不动左栏选项；左键退回左栏，返回键先退回左栏。
+	 */
+	function onRightKey(code: number): boolean {
+		if (code == KEY_UP) {
+			if (focusRow.value > 0) {
+				focusRow.value = focusRow.value - 1
+			}
+			return true
+		}
+		if (code == KEY_DOWN) {
+			if (focusRow.value < rightCount() - 1) {
+				focusRow.value = focusRow.value + 1
+			}
+			return true
+		}
+		if (code == KEY_LEFT) {
+			focusArea.value = 0
+			focusRow.value = 0
+			resetArm()
+			return true
+		}
+		if (code == KEY_BACK) {
+			// 返回键：右栏 → 左栏，再按一次才离开设置页（与重构前一致）
+			onBack()
+			return true
+		}
+		if (code == KEY_OK || code == KEY_ENTER) {
+			if (tabIndex.value == 0) {
+				onLogoutKey()
+			} else if (tabIndex.value == 2) {
+				// 前三行是三档单选，最后一行是 HEVC 兼容开关（点一下开/关）
+				if (focusRow.value < qualityOptions.length) {
+					applyQuality(focusRow.value)
+				} else {
+					toggleHevc()
+				}
+			} else if (tabIndex.value == 4) {
+				// 按键诊断：唯一可聚焦的「清空记录」
+				clearTraces()
+			}
+			return true
+		}
+		return true
+	}
+
+	/** 层「settings.left」：左栏选项列表（基础层） */
+	function onLeftKey(code: number): boolean {
+		if (code == KEY_UP) {
+			if (tabIndex.value > 0) {
+				tabIndex.value = tabIndex.value - 1
+				focusRow.value = 0
+				resetArm()
+			} else {
+				// 已经在第一项：焦点交给导航栏（和其它页面同一套焦点链，
+				// 以前设置页只能按返回离开，用户反馈「不能回到导航栏」）
+				navIndex.value = 4
+			}
+			return true
+		}
+		if (code == KEY_DOWN) {
+			if (tabIndex.value < TABS.length - 1) {
+				tabIndex.value = tabIndex.value + 1
+				focusRow.value = 0
+				resetArm()
+			}
+			return true
+		}
+		if (code == KEY_RIGHT || code == KEY_OK || code == KEY_ENTER) {
+			// 右进右栏：登录状态（退出登录）/ 视频清晰度（三档）才有可聚焦内容。
+			// OK 与右键等价 —— 以前左栏的 OK 什么都不做，看着像「设置页坏了」
+			enterRight()
+			return true
+		}
+		if (code == KEY_BACK) {
+			onBack()
+			return true
+		}
+		return true
+	}
+
+	/** 层名 → 处理函数（UTS 不能把函数放进容器，所以用名字查表） */
+	function runKeyLayer(layer: string, code: number): boolean {
+		if (layer == 'settings.nav') {
+			return onNavKey(code)
+		}
+		if (layer == 'settings.right') {
+			return onRightKey(code)
+		}
+		if (layer == 'settings.left') {
+			return onLeftKey(code)
+		}
+		return false
+	}
+
+	/** 遥控器入口（T5 分发层）：左栏在底，右栏 / 导航栏按焦点压在上面 */
+	function handleKey(code: number) {
+		const stack: Array<string> = []
+		stack.push('settings.left')
+		if (focusArea.value == 1) {
+			stack.push('settings.right')
+		}
+		if (navIndex.value >= 0) {
+			stack.push('settings.nav')
+		}
+		dispatchKey(code, stack, (layer: string, c: number): boolean => {
+			return runKeyLayer(layer, c)
+		})
+		// 停在「按键诊断」栏时：按完键立刻把新的一条画上去（这一行就是现场回放）
+		if (tabIndex.value == 4) {
+			refreshTraces()
+		}
+	}
+
+	/** 订阅遥控器按键（onLoad / onShow 各一次：从搜索页返回时通道已被清掉） */
+	function armKeyHook() {
+		keyHook = startTvKeyHook((code: number) => {
+			handleKey(code)
+		})
+	}
+
+	onLoad(() => {
+		buildRows()
+		quality.value = readQuality()
+		hevcMode.value = readHevcMode()
+		armKeyHook()
+	})
+
+	onShow(() => {
+		pageVisible = true
+		navIndex.value = -1
+		// 每次进入 / 从登录页 / 搜索页回来都重新校验一次 token、读一次清晰度档位与 HEVC 开关，
+		// 并确认按键通道
+		armKeyHook()
+		quality.value = readQuality()
+		hevcMode.value = readHevcMode()
+		refreshLoginState()
+		// 停在「按键诊断」栏时，回来立刻补上最新轨迹（在别处按的键也都在缓冲里）
+		if (tabIndex.value == 4) {
+			refreshTraces()
+		}
+		// 再兜一次：刚进这一页时窗口/回调可能还没就绪，真机上出现过
+		// 「设置页按键完全没反应」（2026-11-23 实测）。start 是幂等的（只换回调），
+		// 加 pageVisible 守卫，避免已经离开还去抢通道。
+		setTimeout(() => {
+			if (pageVisible) {
+				armKeyHook()
+			}
+		}, 260)
+	})
+
+	onHide(() => {
+		pageVisible = false
+	})
+
+	onUnload(() => {
+		pageVisible = false
+		stopTvKeyHook(keyHook)
+		if (armTimer != 0) {
+			clearTimeout(armTimer)
+			armTimer = 0
+		}
+	})
+</script>
+
+<style>
+	/* 与图库页一致的 tvOS 深灰底 */
+	.page {
+		flex: 1;
+		position: relative;
+		background-color: #141418;
+		padding: 6rpx;
+	}
+
+	/* 导航栏悬浮、不占布局高度：用等高占位补回顶部间距（与其他页一致） */
+	.nav-spacer {
+		height: 60rpx;
+		margin-bottom: 8rpx;
+	}
+
+	/* ---------------- 左右布局 3 : 7 ---------------- */
+
+	.main {
+		flex: 1;
+		flex-direction: row;
+	}
+
+	/* 左：选项（约 3 份宽：738 × 0.3 ≈ 216rpx） */
+	.side {
+		width: 216rpx;
+		margin-right: 8rpx;
+	}
+
+	.opt {
+		height: 40rpx;
+		flex-direction: row;
+		align-items: center;
+		margin-bottom: 6rpx;
+		padding-left: 14rpx;
+		border-radius: 8rpx;
+		background-color: #17171C;
+		border-width: 1rpx;
+		border-style: solid;
+		border-color: #2A2A32;
+	}
+
+	/* 选中：蓝色实底（与导航栏分区 / 每行档位同色） */
+	.opt-on {
+		background-color: #3388FF;
+		border-color: #3388FF;
+	}
+
+	/* 遥控器焦点：选中项蓝底上再补白描边，否则蓝底 + 蓝框看不出「焦点在哪」 */
+	.opt-focus {
+		border-color: #FFFFFF;
+	}
+
+	.opt-text {
+		font-size: 13rpx;
+		color: #C6C6CB;
+	}
+
+	.opt-text-on {
+		color: #FFFFFF;
+		font-weight: bold;
+	}
+
+	/* 右：内容（剩余 7 份） */
+	.panel {
+		flex: 1;
+		flex-direction: column;
+		padding: 16rpx;
+		border-radius: 12rpx;
+		background-color: #17171C;
+		border-width: 1rpx;
+		border-style: solid;
+		border-color: #2A2A32;
+	}
+
+	.panel-title {
+		font-size: 13rpx;
+		color: #7C7D7F;
+		margin-bottom: 10rpx;
+	}
+
+	.rows {
+		flex-direction: column;
+	}
+
+	.row {
+		height: 26rpx;
+		flex-direction: row;
+		align-items: center;
+		justify-content: space-between;
+	}
+
+	.row-label {
+		font-size: 12rpx;
+		color: #8A8A8F;
+	}
+
+	.row-value {
+		font-size: 13rpx;
+		color: #FFFFFF;
+	}
+
+	/* 退出登录：整行居中（row + center，比 align-self 在 uvue 里更稳） */
+	.danger-wrap {
+		margin-top: 14rpx;
+		flex-direction: row;
+		justify-content: center;
+	}
+
+	/* 退出登录：红框按钮，遥控器焦点 / 二次确认时变实底 */
+	.danger {
+		height: 34rpx;
+		width: 170rpx;
+		flex-direction: row;
+		align-items: center;
+		justify-content: center;
+		border-radius: 8rpx;
+		background-color: #2A1A1C;
+		border-width: 1rpx;
+		border-style: solid;
+		border-color: #E26052;
+	}
+
+	.danger-focus {
+		background-color: #E26052;
+		border-color: #E26052;
+	}
+
+	.danger-text {
+		font-size: 12rpx;
+		color: #FF8A80;
+	}
+
+	.danger-text-focus {
+		color: #FFFFFF;
+		font-weight: bold;
+	}
+
+	/* ---------------- 视频清晰度：三档单选 ---------------- */
+
+	/* 多档位时行数变多：46rpx 高的行会把最后一档和底部说明挤出屏幕
+	   （16:9 电视上右栏可用高度只有约 300rpx）。五档 = 5×(40+3) + 开关 46 + 说明，
+	   约 280rpx 刚好放得下；再加档位就要重新算，否则最后几行会被裁掉 */
+	.q-row {
+		height: 40rpx;
+		flex-direction: row;
+		align-items: center;
+		justify-content: space-between;
+		margin-bottom: 3rpx;
+		padding-left: 12rpx;
+		padding-right: 12rpx;
+		border-radius: 8rpx;
+		background-color: #14141A;
+		border-width: 1rpx;
+		border-style: solid;
+		border-color: #2A2A32;
+	}
+
+	/* 已选：蓝框 + 偏蓝底（文字不变色，保持可读） */
+	.q-on {
+		background-color: #16233A;
+		border-color: #3388FF;
+	}
+
+	/* 遥控器焦点：只改描边为白色（底色交给 .q-on），定义在 .q-on 之后才能盖住蓝框 */
+	.q-focus {
+		border-color: #FFFFFF;
+	}
+
+	.q-main {
+		flex: 1;
+		flex-direction: column;
+	}
+
+	.q-label {
+		font-size: 13rpx;
+		color: #FFFFFF;
+	}
+
+	.q-desc {
+		font-size: 10rpx;
+		color: #7C7D7F;
+		margin-top: 2rpx;
+	}
+
+	/* 选中标记：蓝勾，右对齐 */
+	.q-check {
+		font-size: 14rpx;
+		font-weight: bold;
+		color: #4C97FF;
+		margin-left: 8rpx;
+	}
+
+	/* HEVC 兼容开关行：说明文字占两行，单独给高一点，别把描述裁掉 */
+	.q-row-switch {
+		height: 46rpx;
+		margin-top: 4rpx;
+	}
+
+	/* 开关胶囊：关 = 灰底灰字，开 = 蓝底白字（不改变行底色，与三档单选区分开） */
+	.q-switch {
+		width: 76rpx;
+		height: 24rpx;
+		flex-direction: row;
+		align-items: center;
+		justify-content: center;
+		border-radius: 12rpx;
+		background-color: #23232B;
+		border-width: 1rpx;
+		border-style: solid;
+		border-color: #33333D;
+		margin-left: 8rpx;
+	}
+
+	.q-switch-on {
+		background-color: #3388FF;
+		border-color: #3388FF;
+	}
+
+	.q-switch-text {
+		font-size: 10rpx;
+		color: #9A9BA0;
+	}
+
+	/* 开启态文字提亮：uvue 没有后代选择器，状态直接挂在文字自己的 class 上 */
+	.q-switch-text-on {
+		color: #FFFFFF;
+		font-weight: bold;
+	}
+
+	.q-note {
+		font-size: 9rpx;
+		color: #55555A;
+		margin-top: 5rpx;
+	}
+
+	/* 暂未开放的两个选项 */
+	.empty {
+		flex: 1;
+		align-items: center;
+		justify-content: center;
+	}
+
+	.empty-text {
+		font-size: 14rpx;
+		color: #6A6A70;
+	}
+
+	.empty-sub {
+		font-size: 11rpx;
+		color: #55555A;
+		margin-top: 6rpx;
+	}
+
+	/* ---------------- 按键诊断（正式包在电视上看不到 logcat 时的唯一线索） ---------------- */
+
+	.diag-hint {
+		font-size: 10rpx;
+		color: #7C7D7F;
+		line-height: 16rpx;
+		margin-bottom: 6rpx;
+	}
+
+	/* 固定高度（12 行 × 15rpx + 内边距）：列表再长也不会把「清空记录」顶下去 */
+	.diag-list {
+		width: 100%;
+		height: 196rpx;
+		background-color: #121216;
+		border-radius: 8rpx;
+		padding: 6rpx;
+		overflow: hidden;
+	}
+
+	/* 等宽感：数字对齐用，颜色区分「命中层」与「none」靠文案，不额外上色 */
+	.diag-line {
+		font-size: 10rpx;
+		color: #C8C9CC;
+		line-height: 15rpx;
+	}
+
+	.diag-empty {
+		font-size: 10rpx;
+		color: #55555A;
+	}
+</style>

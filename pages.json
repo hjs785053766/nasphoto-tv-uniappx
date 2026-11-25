@@ -1,0 +1,59 @@
+{
+  "pages": [
+    {
+      "path": "pages/index/index",
+      "style": {
+        "navigationStyle": "custom",
+        "hideStatusBar": true
+      }
+    },
+    {
+      "path": "pages/home/home",
+      "style": {
+        "navigationStyle": "custom",
+        "hideStatusBar": true
+      }
+    },
+    {
+      "path": "pages/settings/settings",
+      "style": {
+        "navigationStyle": "custom",
+        "hideStatusBar": true
+      }
+    },
+    {
+      "path": "pages/library/library",
+      "style": {
+        "navigationStyle": "custom",
+        "hideStatusBar": true
+      }
+    },
+    {
+      "path": "pages/album/album",
+      "style": {
+        "navigationStyle": "custom",
+        "hideStatusBar": true
+      }
+    },
+    {
+      "path": "pages/album/detail",
+      "style": {
+        "navigationStyle": "custom",
+        "hideStatusBar": true
+      }
+    },
+    {
+      "path": "pages/search/search",
+      "style": {
+        "navigationStyle": "custom",
+        "hideStatusBar": true
+      }
+    }
+  ],
+  "globalStyle": {
+    "navigationStyle": "custom",
+    "backgroundColor": "#08090D",
+    "backgroundColorContent": "#08090D",
+    "pageOrientation": "landscape"
+  }
+}

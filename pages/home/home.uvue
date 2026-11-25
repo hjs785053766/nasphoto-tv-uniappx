@@ -1,0 +1,887 @@
+<template>
+	<view class="page">
+		<!-- 背景：当前场景海报铺满全屏（aspectFill 居中裁切），**不压暗**，保持原图亮度 -->
+		<image v-if="bgSrc.length > 0" class="bg" :src="bgSrc" mode="aspectFill" @error="onBgError" />
+
+		<!-- 全局导航栏（与图库 / 相册同一个组件，悬浮在页面顶部） -->
+		<NavBar
+			:active="0"
+			:focus-index="navIndex"
+			:show-search="true"
+			:show-settings="true"
+			:show-clock="true"
+			:settings-active="false"
+			:search-active="false"
+			@nav="onNavClick"
+			@search="onOpenSearch"
+			@settings="onOpenSettings"
+		/>
+
+		<!-- 中部：当前场景名与数量 -->
+		<view class="hero" v-if="items.length > 0">
+			<text class="hero-kicker">智能场景</text>
+			<text class="hero-name">{{ currentName }}</text>
+			<text class="hero-sub">{{ currentCountText }}</text>
+		</view>
+
+		<!-- 空 / 错误态 -->
+		<view class="status" v-if="items.length == 0">
+			<text class="status-text">{{ statusText }}</text>
+		</view>
+
+		<!-- 底部托盘：横向排开所有场景；选中项在轨道内移动，贴边才推轨道 -->
+		<view :class="trayClass()" v-if="items.length > 0">
+			<scroll-view
+				class="tray-scroll"
+				direction="horizontal"
+				:scroll-left="trayScrollLeft"
+				:show-scrollbar="false"
+				:scroll-with-animation="true"
+			>
+				<view class="tray-inner" :style="innerStyle">
+					<view class="card" :class="cardClass(i)" v-for="(c, i) in items" :key="c.name" @click="onCardClick(i)">
+						<ThumbImage :path="c.thumb" />
+						<view class="card-shade"></view>
+						<text class="card-name" :class="cardNameClass(i)">{{ c.name }}</text>
+					</view>
+				</view>
+			</scroll-view>
+			<view class="pager">
+				<text class="pager-text">{{ pagerText }}</text>
+			</view>
+		</view>
+
+		<!-- 退出确认（返回键弹出）：遥控器左右选「取消 / 退出」，OK 确认，返回键关掉 -->
+		<view class="mask" v-if="exitConfirm">
+			<view class="dialog">
+				<text class="dialog-title">要退出 NAS 相册吗？</text>
+				<text class="dialog-sub">退出后回到电视桌面，下次需要重新打开应用</text>
+				<view class="dialog-btns">
+					<view class="dialog-btn" :class="exitBtnClass(0)" @click="onExitCancel">
+						<text class="dialog-btn-text" :class="exitBtnTextClass(0)">取消</text>
+					</view>
+					<view class="dialog-btn" :class="exitBtnClass(1)" @click="onExitConfirm">
+						<text class="dialog-btn-text" :class="exitBtnTextClass(1)">退出</text>
+					</view>
+				</view>
+			</view>
+		</view>
+	</view>
+</template>
+
+<script setup lang="uts">
+	import { smartCategories, image, quitApp, getToken, startTvKeyHook, stopTvKeyHook } from '@/uni_modules/fnos-auth'
+	import { SceneItem } from '@/common/scene.uts'
+	import { KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_OK, KEY_ENTER, KEY_BACK, dispatchKey } from '@/common/keys.uts'
+	import ThumbImage from '@/pages/library/ThumbImage.uvue'
+	import NavBar from '@/components/NavBar.uvue'
+
+	/**
+	 * 导航栏可聚焦的入口个数：0 首页 / 1 图库 / 2 相册 / 3 搜索 / 4 设置。
+	 * 与 NavBar 的 `focusIndex` 下标一一对应（搜索 / 设置不吃分区高亮，只吃焦点描边）。
+	 */
+	const NAV_COUNT = 5
+	const NAV_SEARCH = 3
+	const NAV_SETTINGS = 4
+
+	// 与样式里的 .card / .tray-inner / .tray 一一对应（rpx），改样式必须同步这里。
+	// 注意 750rpx = 屏宽，16:9 电视的可视高度只有约 422rpx，卡片高度别按竖屏直觉放。
+	// 卡片是**正方形**（宽 = 高），海报用 aspectFill 居中裁切。
+	const CARD_RPX = 76.0
+	const GAP_RPX = 6.0
+	const TRAY_PAD_RPX = 8.0
+	/** .tray 左右外边距（rpx）：托盘不是贴边的，滚动视口要扣掉 */
+	const TRAY_MARGIN_RPX = 12.0
+
+	/** 自动切换默认间隔（秒）；设置页以后往 `fnos.home.interval` 写值即可覆盖 */
+	const DEFAULT_INTERVAL_SEC = 10
+
+	/** 本次页面的按键订阅 id（退订时原样传回，避免误关别的页面的通道） */
+	let keyHook = 0
+	/** 1rpx 对应的像素，onLoad 时按窗口宽度换算 */
+	let unit = 1.0
+	/** 窗口宽度（px），卡片居中计算用 */
+	let windowPx = 750.0
+	/** 自动切换间隔（秒） */
+	let intervalSec = DEFAULT_INTERVAL_SEC
+	/** 页面停留期间的轮播定时器（0 = 未启动） */
+	let autoTimer = 0
+	/** 背景加载序号：快速连按左右时只让最后一张生效 */
+	let bgToken = 0
+
+	const items = ref<Array<SceneItem>>([])
+	const index = ref(0)
+	const loading = ref(true)
+	const errorText = ref('')
+	/** 背景图本地路径（App 端为缓存文件，web 端为 /nas 地址） */
+	const bgSrc = ref('')
+	const trayScrollLeft = ref(0)
+	/** 导航栏遥控器焦点下标（-1 = 焦点在卡片条上，导航栏无焦点） */
+	const navIndex = ref(-1)
+	const bgTriedFile = ref(false)
+	/** 退出确认弹窗（返回键弹出；确认后 quitApp 回电视桌面） */
+	const exitConfirm = ref(false)
+	/** 弹窗里的按钮焦点：0 = 取消，1 = 退出 */
+	const exitFocus = ref(0)
+
+	/**
+	 * 托盘自己的滚动位置模型（px）。
+	 * 不用 `@scroll` 回读：卡片条的 scroll-left 全是我们自己设的，
+	 * 拿模型当读数就够了，也免掉「动画中回调和目标值打架」。
+	 */
+	let trayScroll = 0.0
+
+	const currentName = computed((): string => {
+		const list = items.value
+		const i = index.value
+		if (i < 0 || i >= list.length) {
+			return ''
+		}
+		return list[i].name
+	})
+
+	const currentCountText = computed((): string => {
+		const list = items.value
+		const i = index.value
+		if (i < 0 || i >= list.length) {
+			return ''
+		}
+		return list[i].count.toString() + ' 张照片与视频'
+	})
+
+	const pagerText = computed((): string => {
+		if (items.value.length == 0) {
+			return ''
+		}
+		// 焦点在导航栏时把提示文案也换掉：托盘压暗在个别机型上不一定明显，
+		// 文字一定能看清（真机反馈「按上没反应」，实际是看不出焦点上去了）
+		if (navIndex.value >= 0) {
+			return '← → 选入口 · OK 进入 · ↓ 回到场景条 · 返回 退出'
+		}
+		return (index.value + 1).toString() + ' / ' + items.value.length.toString() +
+			' · 每 ' + intervalSec.toString() + ' 秒自动切换'
+	})
+
+	/**
+	 * 卡片条的显式宽度（rpx）。
+	 * 必须给：flex row 容器默认会被拉伸成 100% 宽，子卡片只是「溢出」而不是撑开容器，
+	 * 于是 scroll-view 的 scrollWidth 等于视口宽、scroll-left 永远被钳到 0（web 实测）。
+	 */
+	const innerStyle = computed((): string => {
+		const n = items.value.length
+		let w = TRAY_PAD_RPX * 2.0
+		if (n > 0) {
+			w = w + n * CARD_RPX + (n - 1) * GAP_RPX
+		}
+		return 'width:' + w.toString() + 'rpx;'
+	})
+
+	const statusText = computed((): string => {
+		if (loading.value) {
+			return '正在加载场景…'
+		}
+		if (errorText.value.length > 0) {
+			return errorText.value
+		}
+		return 'NAS 还没有智能场景分类'
+	})
+
+	/**
+	 * 选中第 i 张时托盘该滚到哪（px）。
+	 *
+	 * 用户口径（2026-11-21，第二次修正）：**左右键是「选中项在轨道里移动」**。
+	 * 所以只在选中项**将要离开可视区**时才推轨道，且**刚好推到贴边**（margin = 0）：
+	 *   - 光标先在一屏卡片里从当前位置逐格移到边缘（用户看得到它在移动）；
+	 *   - 到边缘后每按一次，轨道才跟着走一格。
+	 * 以前的 margin = 1.2 张会让轨道在光标离边缘还有 1.2 张时就开始跟着走，
+	 * 观感就是「整条轨道一直在平移、光标不动」（真机反馈）。
+	 */
+	function trayLeftFor(i: number): number {
+		const n = items.value.length
+		if (n == 0) {
+			return 0.0
+		}
+		const cardPx = CARD_RPX * unit
+		const gapPx = GAP_RPX * unit
+		const padPx = TRAY_PAD_RPX * unit
+		const step = cardPx + gapPx
+		const viewport = windowPx - (TRAY_MARGIN_RPX + TRAY_PAD_RPX) * 2.0 * unit
+		if (viewport <= 0.0) {
+			return 0.0
+		}
+		const contentW = padPx * 2.0 + n * cardPx + (n - 1) * gapPx
+		const max = contentW - viewport
+		const left = padPx + i * step
+		const right = left + cardPx
+		let target = trayScroll
+		if (left < trayScroll) {
+			// 往左越界：刚好让这一张贴左边
+			target = left
+		} else if (right > trayScroll + viewport) {
+			// 往右越界：刚好让这一张贴右边
+			target = right - viewport
+		}
+		if (target < 0.0) {
+			// 贴着左边时不要再往回滚，避免最后一张往右推时抖动
+			return 0.0
+		}
+		if (target > max) {
+			return max < 0.0 ? 0.0 : max
+		}
+		return target
+	}
+
+	/**
+	 * 加载第 i 个场景的全屏背景，同时预取下一张。
+	 * m 尺寸约 150KB，一个自动切换周期（10 秒）足够下完。
+	 */
+	function loadBackground(i: number) {
+		const list = items.value
+		if (i < 0 || i >= list.length) {
+			return
+		}
+		const c = list[i]
+		const token = bgToken + 1
+		bgToken = token
+		bgTriedFile.value = false
+		if (c.cover.length == 0) {
+			bgSrc.value = ''
+			return
+		}
+		image(c.cover).then((local: string) => {
+			if (token == bgToken && local.length > 0) {
+				bgSrc.value = local
+			}
+		})
+		const nextItem = list[(i + 1) % list.length]
+		if (nextItem.cover.length > 0) {
+			image(nextItem.cover).then((_local: string) => {
+				// 只是预热磁盘缓存，不参与展示
+			})
+		}
+	}
+
+	/** 选中第 i 个场景（越界自动回绕，形成循环）；不负责重置计时 */
+	function select(i: number) {
+		const list = items.value
+		if (list.length == 0) {
+			return
+		}
+		let idx = i % list.length
+		if (idx < 0) {
+			idx = idx + list.length
+		}
+		index.value = idx
+		const left = trayLeftFor(idx)
+		trayScroll = left
+		trayScrollLeft.value = left
+		loadBackground(idx)
+	}
+
+	function stopAuto() {
+		if (autoTimer != 0) {
+			clearInterval(autoTimer)
+			autoTimer = 0
+		}
+	}
+
+	/** 页面停留期间自动切换：每 intervalSec 秒下一个，末项之后回到第一项 */
+	function startAuto() {
+		stopAuto()
+		if (items.value.length < 2) {
+			return
+		}
+		autoTimer = setInterval(() => {
+			select(index.value + 1)
+		}, intervalSec * 1000)
+	}
+
+	/** 自动切换间隔：默认 10 秒，设置页以后可以写 `fnos.home.interval`（秒）覆盖 */
+	function readInterval(): number {
+		const raw = uni.getStorageSync('fnos.home.interval')
+		if (raw == null) {
+			return DEFAULT_INTERVAL_SEC
+		}
+		const text = raw.toString().trim()
+		if (text.length == 0) {
+			return DEFAULT_INTERVAL_SEC
+		}
+		const v = parseInt(text)
+		// NaN 参与比较恒为 false，所以用反向判断；同时兜住过小的值
+		if (!(v > 0)) {
+			return DEFAULT_INTERVAL_SEC
+		}
+		if (v < 3) {
+			return 3
+		}
+		return v
+	}
+
+	/** 401 只回登录页一次，避免接口持续失败时反复 reLaunch */
+	let authRedirected = false
+
+	async function loadScenes() {
+		loading.value = true
+		errorText.value = ''
+		const r = await smartCategories()
+		loading.value = false
+		if (!r.ok) {
+			// token 已失效（「退出」回桌面后重新进 App 时最常见，服务端会把旧 AccessToken 作废）。
+			// 交给登录页自动重登：它在自动登录期间会盖一层「正在恢复登录…」，不会闪出登录表单。
+			//
+			// ⚠️ 必须**跨页面实例**限流（存 storage）：home 被 reLaunch 后会重建，
+			// 页面内的布尔量会被重置，于是「401 → 登录页 → 回首页 → 又 401」无限循环，
+			// 把登录页的自动登录次数（60 秒内 3 次）耗光 → 变成「自动登录已暂停」（2026-11-24 实测）。
+			if (r.error.indexOf('401') >= 0 && !authRedirected) {
+				authRedirected = true
+				const lastAt = uni.getStorageSync('fnos.authRedirectAt')
+				const last = lastAt == null ? 0 : parseInt(lastAt.toString())
+				const now = Date.now()
+				if (now - last > 8000) {
+					uni.setStorageSync('fnos.authRedirectAt', now.toString())
+					stopTvKeyHook(keyHook)
+					uni.reLaunch({ url: '/pages/index/index' })
+					return
+				}
+				// 刚刚才跳过一次：这次不再跳，避免把自动登录次数打光
+				errorText.value = '登录状态已失效，请重新登录'
+				return
+			}
+			errorText.value = r.error.length > 0 ? r.error : '场景加载失败'
+			return
+		}
+		authRedirected = false
+		const list: Array<SceneItem> = []
+		for (let i = 0; i < r.items.length; i++) {
+			const c = r.items[i]
+			list.push({
+				name: c.name,
+				count: c.count,
+				cover: c.cover,
+				thumb: c.thumb
+			} as SceneItem)
+		}
+		items.value = list
+		if (list.length > 0) {
+			select(0)
+			startAuto()
+		}
+	}
+
+	/**
+	 * 进入第 i 个场景（被 onCardClick 调用，必须定义在它前面）。
+	 *
+	 * ⚠️ NAS 侧「某个场景里的照片列表」接口尚未确认：`ai-smart-rec/categories` 只给分类
+	 * （name / itemCount / poster），既没有分类 id，也没有 items 端点。所以这里用**已确认的
+	 * AI 搜索**（`magic-search/do`）以场景名当关键字，拿到「这个场景的照片」。
+	 * 真接口确认后**只改这一个函数**（先把场景名写进 storage，再跳搜索页自动执行），
+	 * 不要顺手改搜索页去猜参数 —— 见 AGENTS 5.23。
+	 */
+	function enterScene(i: number) {
+		const list = items.value
+		if (i < 0 || i >= list.length) {
+			return
+		}
+		const name = list[i].name
+		if (name.length == 0) {
+			return
+		}
+		// 进场景就停轮播：回来时 onShow 会重新 startAuto
+		stopAuto()
+		stopTvKeyHook(keyHook)
+		// 中文关键字不进 URL：写 storage，搜索页读走即删（免掉 encode/decode 的坑）
+		uni.setStorageSync('fnos.scene.keyword', name)
+		uni.navigateTo({ url: '/pages/search/search?from=scene' })
+	}
+
+	/** 点击 / OK 卡片：先选中（焦点跟着走），再进入该场景 */
+	function onCardClick(i: number) {
+		select(i)
+		enterScene(i)
+	}
+
+	function cardClass(i: number): string {
+		return i == index.value ? 'card-on' : ''
+	}
+
+	/**
+	 * 托盘样式：焦点在导航栏时整条压暗。
+	 * 只有导航栏那圈细描边时，用户根本看不出「焦点已经上去了」（真机反馈「按上无反应」）。
+	 */
+	function trayClass(): string {
+		return navIndex.value >= 0 ? 'tray tray-idle' : 'tray'
+	}
+
+	function cardNameClass(i: number): string {
+		return i == index.value ? 'card-name-on' : ''
+	}
+
+	/** 导航栏「搜索」：进搜索页（navigateTo，返回键 / × 回首页） */
+	function onOpenSearch() {
+		stopAuto()
+		stopTvKeyHook(keyHook)
+		uni.navigateTo({ url: '/pages/search/search' })
+	}
+
+	/** 导航栏「设置」：进设置页（navigateTo，返回键回首页） */
+	function onOpenSettings() {
+		stopAuto()
+		stopTvKeyHook(keyHook)
+		uni.navigateTo({ url: '/pages/settings/settings' })
+	}
+
+	/**
+	 * 导航栏入口激活（鼠标点击 / 遥控器 OK 共用）：
+	 * 0 = 首页（本页，忽略），1 = 图库，2 = 相册（两者 redirectTo，同层级互切），
+	 * 3 = 搜索，4 = 设置（navigateTo，返回键回首页）。
+	 */
+	function onNavClick(i: number) {
+		if (i == 1) {
+			stopAuto()
+			stopTvKeyHook(keyHook)
+			uni.redirectTo({ url: '/pages/library/library' })
+		} else if (i == 2) {
+			stopAuto()
+			stopTvKeyHook(keyHook)
+			uni.redirectTo({ url: '/pages/album/album' })
+		} else if (i == NAV_SEARCH) {
+			onOpenSearch()
+		} else if (i == NAV_SETTINGS) {
+			onOpenSettings()
+		}
+	}
+
+	/**
+	 * 返回键：弹出退出确认（2026-11-21 用户口径）。
+	 *
+	 * 以前直接 reLaunch 回登录页，副作用很大：连按两次返回会在「reLaunch 还没落地」
+	 * 时又触发一次，页面卡在中间状态、遥控器全失效。现在只切一个弹窗状态，不换页。
+	 */
+	function openExitConfirm() {
+		exitFocus.value = 0
+		exitConfirm.value = true
+	}
+
+	function closeExitConfirm() {
+		exitConfirm.value = false
+	}
+
+	function onExitCancel() {
+		closeExitConfirm()
+	}
+
+	/** 确认退出：先退订通道、停轮播，再关掉整个任务回电视桌面 */
+	function onExitConfirm() {
+		closeExitConfirm()
+		stopAuto()
+		stopTvKeyHook(keyHook)
+		quitApp()
+	}
+
+	function exitBtnClass(i: number): string {
+		return i == exitFocus.value ? 'dialog-btn dialog-btn-focus' : 'dialog-btn'
+	}
+
+	function exitBtnTextClass(i: number): string {
+		return i == exitFocus.value ? 'dialog-btn-text dialog-btn-text-focus' : 'dialog-btn-text'
+	}
+
+	/** 层「home.exit」：退出确认弹窗（栈顶，模态）。左右切按钮，OK 确认，返回关掉 */
+	function onExitKey(code: number): boolean {
+		if (code == KEY_LEFT || code == KEY_RIGHT) {
+			exitFocus.value = exitFocus.value == 0 ? 1 : 0
+		} else if (code == KEY_OK || code == KEY_ENTER) {
+			if (exitFocus.value == 0) {
+				onExitCancel()
+			} else {
+				onExitConfirm()
+			}
+		} else if (code == KEY_BACK) {
+			onExitCancel()
+		}
+		return true
+	}
+
+	/**
+	 * 层「home.nav」：导航栏焦点（覆盖层，吞掉所有键）。
+	 * 左右在「首页 / 图库 / 相册 / 搜索 / 设置」五个入口间**循环**，OK 进入，下 / 返回退回卡片条。
+	 */
+	function onNavKey(code: number): boolean {
+		if (code == KEY_LEFT) {
+			navIndex.value = (navIndex.value + NAV_COUNT - 1) % NAV_COUNT
+		} else if (code == KEY_RIGHT) {
+			navIndex.value = (navIndex.value + 1) % NAV_COUNT
+		} else if (code == KEY_OK || code == KEY_ENTER) {
+			onNavClick(navIndex.value)
+		} else if (code == KEY_DOWN) {
+			navIndex.value = -1
+		} else if (code == KEY_BACK) {
+			// 用户口径（2026-11-21）：**首页按返回 = 退出确认**，不管焦点在哪。
+			// 以前这里只把焦点退回卡片条，用户按返回「什么都没发生」。
+			navIndex.value = -1
+			openExitConfirm()
+		}
+		return true
+	}
+
+	/** 层「home.tray」：底部卡片托盘（基础层） */
+	function onTrayKey(code: number): boolean {
+		if (code == KEY_LEFT) {
+			// 上一个：手动切换后重新计时
+			select(index.value - 1)
+			startAuto()
+		} else if (code == KEY_RIGHT) {
+			select(index.value + 1)
+			startAuto()
+		} else if (code == KEY_UP) {
+			// 上键进导航栏，停在「首页」（当前分区）
+			navIndex.value = 0
+		} else if (code == KEY_OK || code == KEY_ENTER) {
+			// OK = 进入当前选中的场景（以前这里没有分支，按 OK 完全没反应）
+			onCardClick(index.value)
+		} else if (code == KEY_BACK) {
+			openExitConfirm()
+		} else {
+			return false
+		}
+		return true
+	}
+
+	/** 层名 → 处理函数（UTS 不能把函数放进容器，所以用名字查表） */
+	function runKeyLayer(layer: string, code: number): boolean {
+		if (layer == 'home.exit') {
+			return onExitKey(code)
+		}
+		if (layer == 'home.nav') {
+			return onNavKey(code)
+		}
+		if (layer == 'home.tray') {
+			return onTrayKey(code)
+		}
+		return false
+	}
+
+	/** 遥控器入口（T5 分发层）：托盘在底，导航栏焦点 / 退出确认依次压在上面 */
+	function handleKey(code: number) {
+		const stack: Array<string> = []
+		stack.push('home.tray')
+		if (navIndex.value >= 0) {
+			stack.push('home.nav')
+		}
+		if (exitConfirm.value) {
+			stack.push('home.exit')
+		}
+		dispatchKey(code, stack, (layer: string, c: number): boolean => {
+			return runKeyLayer(layer, c)
+		})
+	}
+
+	/**
+	 * 个别 ROM 上 <image> 只认 file:// URI（与 ThumbImage 同一处理），
+	 * 加载失败时补一次前缀重试。
+	 */
+	function onBgError() {
+		// #ifdef APP-ANDROID
+		if (!bgTriedFile.value && bgSrc.value.length > 0 && !bgSrc.value.startsWith('file://')) {
+			bgTriedFile.value = true
+			bgSrc.value = 'file://' + bgSrc.value
+		}
+		// #endif
+	}
+
+	/**
+	 * 订阅遥控器按键。
+	 * onLoad 和 onShow 各订阅一次：navigateTo 出去（设置 / 搜索）再返回时，
+	 * 上一页的 onUnload 已把通道清掉，不重新订阅的话遥控器就全失效（AGENTS 5.12）。
+	 */
+	function armKeyHook() {
+		keyHook = startTvKeyHook((code: number) => {
+			handleKey(code)
+		})
+	}
+
+	onLoad(() => {
+		const info = uni.getWindowInfo()
+		unit = info.windowWidth / 750.0
+		windowPx = info.windowWidth
+		intervalSec = readInterval()
+		armKeyHook()
+		// ⚠️ 冷启动时 AccessToken 只在内存里（重启必丢），所以**先确认有 token 再发请求**。
+		// 以前直接 `loadScenes()`：插件会在后台自动登录一次（ensureToken），
+		// 而登录页的自动登录同时也在跑，两次登录互相把对方的 AccessToken 顶掉 →
+		// 首页拿到 401「访问码已失效」，并且怎么重试都还是 401（2026-11-24 实测）。
+		// 现在统一走「登录页登录一次」，首页只消费结果，不再自己触发登录。
+		if (getToken().length == 0) {
+			// 加 10 秒限流：万一登录页没能拿到 token（例如需要两步验证），
+			// 也不能把用户困在「首页 ↔ 登录页」的来回跳里（真机实测会连跳 3 次然后卡住）
+			const lastAt = uni.getStorageSync('fnos.authRedirectAt')
+			const last = lastAt == null ? 0 : parseInt(lastAt.toString())
+			const now = Date.now()
+			if (now - last > 10000) {
+				uni.setStorageSync('fnos.authRedirectAt', now.toString())
+				uni.reLaunch({ url: '/pages/index/index' })
+				return
+			}
+			errorText.value = '登录状态已失效，请重新登录'
+			return
+		}
+		loadScenes()
+	})
+
+	onShow(() => {
+		// 从图库 / 相册 / 设置 / 搜索回来时页面重新可见：
+		// 恢复自动切换与按键通道，并把遥控器焦点放回下方卡片条（与首次进入一致）
+		navIndex.value = -1
+		exitConfirm.value = false
+		armKeyHook()
+		startAuto()
+	})
+
+	onHide(() => {
+		stopAuto()
+		// 离开页面时弹窗不能留着：回来再次按返回应该是「先弹窗」而不是「已经在确认态」
+		exitConfirm.value = false
+	})
+
+	onUnload(() => {
+		stopAuto()
+		stopTvKeyHook(keyHook)
+	})
+</script>
+
+<style>
+	.page {
+		flex: 1;
+		position: relative;
+		background-color: #08090D;
+	}
+
+	/* ---------------- 背景 ---------------- */
+
+	.bg {
+		position: absolute;
+		left: 0;
+		top: 0;
+		width: 100%;
+		height: 100%;
+	}
+
+	/* ---------------- 中部场景信息 ---------------- */
+
+	/* 贴在托盘上方（托盘约 100rpx + 底部 12rpx + 20rpx 间距），16:9 电视可视高度约 422rpx。
+	   背景不压暗，所以文字自带一层半透明底（宽度随内容，不是整屏暗带）。 */
+	.hero {
+		position: absolute;
+		left: 20rpx;
+		bottom: 132rpx;
+		flex-direction: column;
+		padding-top: 8rpx;
+		padding-right: 14rpx;
+		padding-bottom: 8rpx;
+		padding-left: 14rpx;
+		border-radius: 12rpx;
+		background-color: rgba(16, 16, 20, 0.45);
+	}
+
+	.hero-kicker {
+		font-size: 9rpx;
+		color: rgba(255, 255, 255, 0.66);
+	}
+
+	.hero-name {
+		font-size: 28rpx;
+		font-weight: bold;
+		color: #FFFFFF;
+		margin-top: 4rpx;
+	}
+
+	.hero-sub {
+		font-size: 10rpx;
+		color: rgba(255, 255, 255, 0.74);
+		margin-top: 4rpx;
+	}
+
+	/* ---------------- 空 / 错误态 ---------------- */
+
+	.status {
+		position: absolute;
+		left: 0;
+		right: 0;
+		top: 0;
+		bottom: 0;
+		align-items: center;
+		justify-content: center;
+	}
+
+	.status-text {
+		font-size: 16rpx;
+		color: #9A9A9F;
+	}
+
+	/* ---------------- 底部卡片托盘 ---------------- */
+
+	.tray {
+		position: absolute;
+		left: 12rpx;
+		right: 12rpx;
+		bottom: 12rpx;
+		border-radius: 16rpx;
+		background-color: rgba(16, 16, 20, 0.62);
+		border-width: 1rpx;
+		border-style: solid;
+		border-color: rgba(255, 255, 255, 0.08);
+		padding-top: 8rpx;
+		padding-bottom: 2rpx;
+	}
+
+	/* 焦点上到导航栏时压暗整条托盘：让「焦点已经不在场景条上」一眼可见 */
+	.tray-idle {
+		opacity: 0.45;
+	}
+
+	/* 高 76rpx（= 卡片边长），与 CARD_RPX / GAP_RPX / TRAY_PAD_RPX 一起决定滚动偏移 */
+	.tray-scroll {
+		width: 100%;
+		height: 76rpx;
+	}
+
+	.tray-inner {
+		flex-direction: row;
+		align-items: center;
+		padding-left: 8rpx;
+		padding-right: 8rpx;
+		height: 76rpx;
+	}
+
+	/* 正方形卡片：宽 = 高 = CARD_RPX */
+	.card {
+		width: 76rpx;
+		height: 76rpx;
+		margin-right: 6rpx;
+		border-radius: 6rpx;
+		overflow: hidden;
+		position: relative;
+		background-color: #1A1A20;
+		border-width: 2rpx;
+		border-style: solid;
+		border-color: rgba(255, 255, 255, 0.10);
+	}
+
+	.card-on {
+		border-color: #3388FF;
+	}
+
+	/* 卡片底部压暗，保证场景名可读 */
+	.card-shade {
+		position: absolute;
+		left: 0;
+		bottom: 0;
+		width: 100%;
+		height: 24rpx;
+		background-color: rgba(0, 0, 0, 0.55);
+	}
+
+	.card-name {
+		position: absolute;
+		left: 0;
+		bottom: 3rpx;
+		width: 100%;
+		text-align: center;
+		font-size: 9rpx;
+		color: rgba(255, 255, 255, 0.82);
+	}
+
+	.card-name-on {
+		color: #FFFFFF;
+		font-weight: bold;
+	}
+
+	.pager {
+		height: 12rpx;
+		flex-direction: row;
+		align-items: center;
+		justify-content: center;
+	}
+
+	.pager-text {
+		font-size: 8rpx;
+		color: rgba(255, 255, 255, 0.55);
+	}
+
+	/* ---------------- 退出确认弹窗 ---------------- */
+
+	/* 铺满整页压暗背景：z-index 必须高于 NavBar（10）和托盘 */
+	.mask {
+		position: absolute;
+		left: 0;
+		top: 0;
+		width: 100%;
+		height: 100%;
+		z-index: 30;
+		align-items: center;
+		justify-content: center;
+		background-color: rgba(0, 0, 0, 0.62);
+	}
+
+	.dialog {
+		width: 380rpx;
+		flex-direction: column;
+		align-items: center;
+		padding: 22rpx;
+		border-radius: 14rpx;
+		background-color: #1C1C22;
+		border-width: 1rpx;
+		border-style: solid;
+		border-color: #33333C;
+	}
+
+	.dialog-title {
+		font-size: 17rpx;
+		color: #FFFFFF;
+		font-weight: bold;
+	}
+
+	.dialog-sub {
+		font-size: 10rpx;
+		color: #9A9AA0;
+		margin-top: 8rpx;
+		text-align: center;
+	}
+
+	.dialog-btns {
+		flex-direction: row;
+		margin-top: 18rpx;
+	}
+
+	/* 两个按钮等宽：取消在前（默认焦点），退出在后 */
+	.dialog-btn {
+		width: 140rpx;
+		height: 34rpx;
+		flex-direction: row;
+		align-items: center;
+		justify-content: center;
+		margin-left: 7rpx;
+		margin-right: 7rpx;
+		border-radius: 8rpx;
+		background-color: #26262E;
+		border-width: 2rpx;
+		border-style: solid;
+		border-color: #26262E;
+	}
+
+	/* 遥控器焦点：蓝底 + 蓝描边（与其它页面的选中态同一套颜色） */
+	.dialog-btn-focus {
+		background-color: #3388FF;
+		border-color: #3388FF;
+	}
+
+	.dialog-btn-text {
+		font-size: 13rpx;
+		color: #C6C6CB;
+	}
+
+	.dialog-btn-text-focus {
+		color: #FFFFFF;
+		font-weight: bold;
+	}
+</style>

@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <application
+        android:name="io.dcloud.uniapp.UniApplication"
+        android:allowBackup="true"
+        android:largeHeap="true"
+        tools:replace="android:allowBackup">
+
+        <!-- uni-app x（VDOM 模式）入口 Activity：挂 LAUNCHER，点开 App 直接进入 uni-app x 页面 -->
+        <activity
+            android:name="io.dcloud.uniapp.UniAppActivity"
+            android:configChanges="orientation|keyboard|keyboardHidden|smallestScreenSize|screenLayout|screenSize|mcc|mnc|fontScale|navigation|uiMode"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:theme="@style/UniAppX.Activity.DefaultTheme"
+            android:windowSoftInputMode="adjustResize"
+            tools:replace="android:label,android:exported,android:theme,android:configChanges,android:windowSoftInputMode">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- 应用 appid：必须和 HBuilderX 里项目的 appid 一致，打包脚本会自动替换 -->
+        <meta-data
+            android:name="DCLOUD_UNI_APPID"
+            android:value="__UNI__1B208D1" />
+
+        <meta-data
+            android:name="DCLOUD_CHANNEL"
+            android:value="default" />
+    </application>
+</manifest>

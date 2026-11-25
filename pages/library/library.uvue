@@ -1,0 +1,2183 @@
+<template>
+	<view class="page">
+		<!-- 全局导航栏（悬浮在页面顶部，与首页 / 相册共用 components/NavBar.uvue）
+		     遥控器上键到顶 / 返回键会先把焦点交到这里（见 5.25） -->
+		<NavBar
+			:active="1"
+			:focus-index="navIndex"
+			:show-search="true"
+			:show-settings="true"
+			:show-clock="true"
+			:settings-active="false"
+			:search-active="false"
+			@nav="onNavClick"
+			@search="onOpenSearch"
+			@settings="onOpenSettings"
+		/>
+		<!-- 导航栏不占布局高度，用等高空白撑出原有间距（viewportPx 估算不受影响） -->
+		<view class="nav-spacer"></view>
+
+		<!-- 工具条：左侧总数 / 错误提示，右侧每行张数切换 -->
+		<view class="topbar">
+			<view class="tb-left">
+				<text class="tb-sub">{{ totalText }}</text>
+				<text class="tb-error" v-if="errorText.length > 0">{{ errorText }}</text>
+			</view>
+			<view class="tb-right">
+				<!-- 每行张数切换 -->
+				<view class="col-switch">
+					<text class="col-switch-label">每行</text>
+					<view
+						class="col-btn"
+						:class="colBtnClass(i)"
+						v-for="(n, i) in COL_OPTIONS"
+						:key="n"
+						@click="onColClick(i)"
+					>
+						<text class="col-btn-text" :class="colTextClass(i)">{{ n }}</text>
+					</view>
+					<text class="col-switch-unit">张</text>
+				</view>
+			</view>
+		</view>
+
+		<!-- 主体：照片网格 + 右侧年份时间轴 -->
+		<view class="body">
+			<!--
+				scroll-into-view 是原生滚动，不依赖「先设 scroll-top 再等它生效」那套时序，
+				跳转落点用它最稳（`:scroll-top` 在真机上后续赋值并不可靠，见 AGENTS 5.2）。
+				scrollTop 继续保留：web 端 scroll-into-view 不生效，靠它兜底。
+			-->
+			<scroll-view
+				class="grid"
+				:key="cols"
+				direction="vertical"
+				:scroll-top="scrollTop"
+				:scroll-into-view="scrollIntoId"
+				:show-scrollbar="false"
+				:lower-threshold="600"
+				@scroll="onScroll"
+				@scrolltolower="onLower"
+			>
+				<!-- 顶部可滚留白：没有它的话页面一进来就在最顶，向上滚不动，
+				     也就永远不会触发「加载更早照片」。
+				     已经在全库最前面（上面没有更晚的照片）时收起，
+				     否则滚到顶会留一条滚不动的空白带 -->
+				<view class="prev-gap" v-if="!atNewest"></view>
+
+				<view class="group" :id="groupId(g.key)" v-for="g in groups" :key="g.key">
+					<view class="month-row" v-if="g.firstOfMonth">
+						<text class="month-text">{{ g.monthLabel }}</text>
+					</view>
+					<view class="day-row">
+						<text class="day-text">{{ g.label }}</text>
+					</view>
+					<view class="cells">
+						<!-- 当前选中：**直接给格子加边框**（不再用绝对定位的浮层子节点）。
+						     真机上 `position:absolute` 的子层在原生视图里不一定画得出来，
+						     表现就是「有焦点走位但看不到框」（2026-11-23 TV 实测）。
+						     `.cell` 恒留 4rpx 透明边框 + border-box，所以加框不会改变格子尺寸。 -->
+						<view class="cell" :class="cellClass(c.idx)" :style="cellStyle" v-for="c in g.items" :key="c.photo.id" @click="onCellClick(c.idx)">
+							<LazyThumb :path="c.photo.thumb" :active="c.idx >= winLo && c.idx <= winHi" />
+							<!-- 左下角类型角标：视频（带时长）/ 实况照片，让网格一眼分清能不能播、是不是实况。
+							     文案 / 标记来自 CellItem.tag / CellItem.live（预计算，模板里不调导入函数） -->
+							<view class="cell-tag" v-if="c.photo.cat == 'video'">
+								<text class="cell-tag-icon">▶</text>
+								<text class="cell-tag-text">{{ c.tag }}</text>
+							</view>
+							<view class="cell-tag" v-if="c.live">
+								<view class="live-ring">
+									<view class="live-core"></view>
+								</view>
+								<text class="cell-tag-text">实况</text>
+							</view>
+						</view>
+					</view>
+				</view>
+
+				<view class="loading" v-if="loading">
+					<text class="loading-text">正在加载…</text>
+				</view>
+				<view class="loading" v-if="!loading && atEnd && groups.length > 0">
+					<text class="loading-text">已经到底了</text>
+				</view>
+				<view class="empty" v-if="!loading && groups.length == 0">
+					<text class="empty-text">{{ errorText.length > 0 ? errorText : '这里还没有照片' }}</text>
+				</view>
+
+			</scroll-view>
+
+			<!-- 右侧时间轴：年 / 月 全部平铺，自身可滚动 -->
+			<scroll-view
+				class="rail"
+				direction="vertical"
+				:scroll-top="railScrollTop"
+				:show-scrollbar="false"
+			>
+				<view
+					class="rail-item"
+					:class="railItemClass(i)"
+					v-for="(nd, i) in railNodes"
+					:key="nd.key"
+					@click="onRailClick(i)"
+				>
+					<!-- 标签在左、节点列在右：细线贯穿整行，月份行叠圆点，
+					     年份行叠一颗星（年份刻度，比圆点更醒目又不加高行高） -->
+					<text :class="railLabelClass(i)">{{ nd.label }}</text>
+					<view class="rail-node">
+						<view class="rail-line"></view>
+						<view class="rail-star" v-if="nd.isYear">
+							<text class="rail-star-text" :class="railStarTextClass(i)">★</text>
+						</view>
+						<view class="rail-dot" v-else></view>
+					</view>
+				</view>
+			</scroll-view>
+		</view>
+
+		<!-- 查看器：与相册内页共用 components/PhotoViewer.uvue
+		     （图片 / 视频 / 实况 / 详情面板都在组件里，遥控器按键也由组件接管）。
+		     关闭后 scroll-view 没有重新挂载，图库滚动位置自然保持不变 -->
+		<PhotoViewer
+			v-if="viewerOpen"
+			:photos="photos"
+			:index="viewerIndex"
+			:canPrev="true"
+			:canNext="true"
+			@close="onViewerClose"
+			@nav="onViewerNav"
+		/>
+	</view>
+</template>
+
+<script setup lang="uts">
+	import { timeline, page, logout, startTvKeyHook, stopTvKeyHook } from '@/uni_modules/fnos-auth'
+	import { PhotoItem, videoTagText, showLiveTag } from '@/common/photo.uts'
+	import { KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_OK, KEY_ENTER, KEY_BACK, dispatchKey } from '@/common/keys.uts'
+	import LazyThumb from '@/components/LazyThumb.uvue'
+	import PhotoViewer from '@/components/PhotoViewer.uvue'
+	import NavBar from '@/components/NavBar.uvue'
+
+	/** 每页条数 */
+	const PAGE_SIZE = 60
+
+	/**
+	 * 照片窗口上限（张）。
+	 *
+	 * 图库是「滑动窗口」模型：向下补页追加、向上补页前插，但**以前从不丢弃**，
+	 * 翻十几页就攒到上千个缩略图节点 —— 真机表现是「越滑越卡、最后连缩略图都渲染不出来」
+	 * （2026-11-24 反馈）。4 页（240 张）足够覆盖一屏来回滚动，超出的从远端丢掉。
+	 */
+	const WINDOW_MAX = 240
+
+	/**
+	 * `[lib]` 诊断日志开关。
+	 *
+	 * `console.log` 在 Android 上是同步写 logcat，滚动 / 长按这种高频路径里非常贵
+	 * （2026-11-21 用户反馈「长按后整机明显卡顿」就是它 + 每键 10 个定时器）。
+	 * 排查滚动问题时临时改 true，验完改回 false。
+	 */
+	const LIB_DEBUG = false
+
+	/** 本次页面的按键订阅 id（退订时原样传回，避免误关别的页面的通道） */
+	let keyHook = 0
+	/** 右上角可选的每行张数 */
+	const COL_OPTIONS: Array<number> = [8, 6, 4]
+	/** 网格可用宽度（rpx）= 750 − 页面左右边距 12 − 右侧时间轴 70 */
+	const GRID_WIDTH_RPX = 668
+	/** 单元格四周外边距之和（2rpx × 2） */
+	const CELL_MARGIN_RPX = 4
+	/** 时间轴行高（rpx）：月份行 15，年份行 18（年份作分组标题，上下留白更多） */
+	const RAIL_MONTH_RPX = 15.0
+	const RAIL_YEAR_RPX = 18.0
+
+	/**
+	 * 网格单元格：photo 是原照片，idx 是它在 photos 数组里的全局下标（打开查看器时用）。
+	 * `tag` / `live` 是角标用的**预计算结果**：模板里直接调 `common/photo.uts` 的导入函数
+	 * 会被编译成 `unref(fn)(...)` 而报「找不到名称 invoke」（见 AGENTS 5.2）。
+	 */
+	type CellItem = {
+		photo: PhotoItem
+		idx: number
+		tag: string
+		live: boolean
+	}
+
+	type DayGroup = {
+		key: string
+		year: number
+		month: number
+		label: string
+		monthLabel: string
+		firstOfMonth: boolean
+		items: Array<CellItem>
+	}
+
+	type YearItem = {
+		year: number
+		offset: number
+	}
+
+	type MonthItem = {
+		year: number
+		month: number
+		offset: number
+	}
+
+	/** 时间轴节点：年份行，以及当前年份展开出的月份行 */
+	type RailNode = {
+		key: string
+		label: string
+		isYear: boolean
+		year: number
+		month: number
+		offset: number
+		isActive: boolean
+		indent: boolean
+	}
+
+	const photos = ref<Array<PhotoItem>>([])
+	const years = ref<Array<YearItem>>([])
+	/** 全量月份（倒序），用于展开当前年份的月份 */
+	const months = ref<Array<MonthItem>>([])
+	const total = ref(0)
+	const loading = ref(false)
+	const atEnd = ref(false)
+	const errorText = ref('')
+	/**
+	 * 是否已经在全库最前面（列表第一条就是全库最新的照片）。
+	 * 此时向上已经没有可加载的内容，顶部留白必须收起，
+	 * 否则滚到顶会留一条怎么滚都滚不动的空白带。
+	 */
+	const atNewest = ref(false)
+
+	const activeYear = ref(0)
+	const activeMonth = ref(0)
+	const railFocus = ref(false)
+	const railIndex = ref(0)
+	const scrollTop = ref(0)
+	/**
+	 * `scroll-into-view` 的锚点分组 id（空串 = 不定位）。
+	 * 真机上 `:scroll-top` 的后续赋值不可靠，跳转落点靠原生滚动到目标分组；
+	 * 只在 app-android 有意义，web 端由 `scrollTop` 兜底。
+	 */
+	const scrollIntoId = ref('')
+	/** 时间轴自身滚动位置（年/月平铺后超出可视高度） */
+	const railScrollTop = ref(0)
+
+	/** 当前每行张数（右上角可切换 8 / 6 / 4） */
+	const cols = ref(6)
+	/**
+	 * 导航栏遥控器焦点（-1 = 焦点在网格里）。上键到顶 / 返回键会把焦点交到导航栏，
+	 * 再按返回才离开本页（用户口径 2026-11-22，见 AGENTS 5.25）。
+	 */
+	const navIndex = ref(-1)
+	/** 导航栏可聚焦的入口个数：0 首页 / 1 图库 / 2 相册 / 3 搜索 / 4 设置 */
+	const NAV_COUNT = 5
+
+	/** 右上角布局切换区是否持有遥控器焦点（时间轴最顶再按上进入） */
+	const layoutFocus = ref(false)
+	/** 布局区当前高亮档位索引，对应 COL_OPTIONS */
+	const layoutIndex = ref(1)
+
+	/**
+	 * **遥控器光标**：当前选中的照片在 `photos` 窗口里的下标。
+	 *
+	 * 2026-11-21 用户口径（第三条反馈之后重做的模型）：
+	 *   - 上下键 = **光标在网格里移动一格**，只有光标要出视口时才滚动页面
+	 *     （以前是「按键就整页滚 2 行」，光标钉死在视口顶部，观感很差）；
+	 *   - OK 打开的**就是光标那一张**；
+	 *   - 从查看器返回后，光标停在刚才看的那张上；
+	 *   - 时间轴高亮也跟着光标走。
+	 *
+	 * 只有**用户自己滚动**（web 滚轮 / 拖动）时才用 `indexAtScroll` 反推光标。
+	 */
+	const cursorIdx = ref(0)
+
+	/**
+	 * 缩略图渲染窗口（按**照片下标**）：只让光标附近的格子下载并持有位图。
+	 *
+	 * 图库和图库内页一样没有虚拟列表，补页后所有格子都会建原生 image 视图；
+	 * 每张缩略图（sUrl 240×320 解到格子尺寸）约 360KB 常驻内存，翻几百张就上百 MB。
+	 * 窗口用 computed 直接跟随光标：布局与滚动高度完全不变，只是「谁保留位图」。
+	 */
+	const WIN_ROWS_ABOVE = 8
+	const WIN_ROWS_BELOW = 10
+	const winLo = computed((): number => {
+		const lo = cursorIdx.value - WIN_ROWS_ABOVE * cols.value
+		return lo < 0 ? 0 : lo
+	})
+	const winHi = computed((): number => {
+		return cursorIdx.value + WIN_ROWS_BELOW * cols.value
+	})
+
+	/**
+	 * 光标锁定截止时间（毫秒）。
+	 *
+	 * 我们为了「让光标可见」而程序化滚动时，`onScroll` 会在几十毫秒内回调；
+	 * 如果不忽略这次回调，`indexAtScroll` 会把光标又拽回视口顶部那张，
+	 * 长按时表现为「光标乱跳 / 消失」（真机反馈）。
+	 */
+	let cursorLockUntil = 0
+
+	/**
+	 * 「在第一行按上触发了补页」的标记：补页完成后要把光标再上移一行，
+	 * 落进刚插进来的那批照片里。放在 loadPrev 里统一处理，避免 async 回调满天飞。
+	 */
+	let pendingCursorUp = false
+
+	// ---------------- 图片查看器 ----------------
+	// 这块状态必须声明在第一次使用之前：onScroll 会读 viewerOpen。
+	// UTS 编译成 Kotlin 后没有声明提升，「先使用后声明」会让模板 render 报
+	// Unresolved reference 'viewerOpen'（AGENTS 5.2 的同一条坑）。
+
+	const viewerOpen = ref(false)
+	const viewerIndex = ref(0)
+	/**
+	 * 当前照片在**整个图库**里的下标。
+	 * photos 只是 [startOffset, currentOffset) 的窗口，左右翻到窗口边缘时必须补页，
+	 * 所以不能只用 viewerIndex（那是窗口内下标）。
+	 */
+	let viewerOffset = 0
+	/** 连按左右键时累积的目标下标，viewerMoving=true 表示正在追赶 */
+	let viewerMoving = false
+	let viewerTarget = 0
+	/** 每次打开/关闭 +1：让上一次跨页补数据的循环失效 */
+	let viewerSession = 0
+
+	let currentOffset = 0
+	let currentScroll = 0
+	/** 列表第一条在整个图库里的下标：向上滚动时用它往前取一页 */
+	let startOffset = 0
+	let loadingPrev = false
+	/** 补页期间又被请求了一次：当前这次结束后自动再补一页（连按上键时不丢请求） */
+	let prevPending = false
+	/** 跳转后短暂禁止向上加载，避免刚落位就被推走 */
+	let prevGuard = 0
+	/**
+	 * 程序化跳转后目标 scrollTop（-1 表示没有待确认的定位）。
+	 * 跳转时 scrollTop 是我们自己设的，但像素累计和实际渲染会有几像素误差，
+	 * 用它产生的 scroll 事件去算高亮，会把刚选中的末月错判成上一批照片的月份。
+	 */
+	let pinnedTop = -1.0
+	/** 定位窗口截止时间：窗口内忽略 scroll 驱动的高亮 */
+	let pinGuard = 0
+	/** 上一次滚动位置，用来判断滚动方向 */
+	let lastScrollTop = 0
+	/** 1rpx 对应的物理像素（onLoad 时按窗口宽度换算） */
+	let unit = 1.0
+	/** 网格可视区高度（px）：内容比它矮时 scroll-view 无法滚动，需要主动补页 */
+	let viewportPx = 400.0
+	/** 批量补页期间不做滚动补偿，避免中途把视口顶来顶去 */
+	let suppressCompensate = false
+
+	// 布局尺寸（px），onLoad 时按屏幕宽度换算，用于把滚动位置映射到日期分组
+	// 行高 = 单格边长 + 上下各 2rpx 边距
+	let cellPx = 98.0
+	let dayHeaderPx = 34.0
+	let monthHeaderPx = 30.0
+	let groupGapPx = 8.0
+	/** 时间轴标准行高（月份行，px），必须与 .rail-item 的 height（15rpx）一致 */
+	let railItemPx = 15.0
+	/** 列表顶部留白高度（px），必须与 .prev-gap 一致 */
+	let prevGapPx = 24.0
+
+	/** 当前实际生效的顶部留白（px）：已经在全库最前面时没有留白 */
+	function gapPx(): number {
+		return atNewest.value ? 0.0 : prevGapPx
+	}
+
+	/**
+	 * `[lib]` 诊断日志（受 `LIB_DEBUG` 控制）。
+	 * 滚动 / 长按这类高频路径一律走它，不要在真机路径上直接 `console.log`。
+	 */
+	function libLog(msg: string) {
+		if (LIB_DEBUG) {
+			console.log(msg)
+		}
+	}
+
+	const totalText = computed((): string => {
+		if (total.value <= 0) {
+			return '—'
+		}
+		return total.value.toString() + ' 张'
+	})
+
+	/** 单格边长（rpx）：把可用宽度均分给 cols 列，再减去外边距 */
+	function cellSizeRpx(n: number): number {
+		return Math.floor(GRID_WIDTH_RPX / n) - CELL_MARGIN_RPX
+	}
+
+	/** 格子内联尺寸（rpx），随右上角切换实时变化 */
+	const cellStyle = computed((): string => {
+		const s = cellSizeRpx(cols.value)
+		return 'width:' + s.toString() + 'rpx;height:' + s.toString() + 'rpx;'
+	})
+
+	/** 是否已经在跳回登录页（避免多个请求同时失败时重复 reLaunch） */
+	let redirecting = false
+	/** 上次「鉴权失败」的时间戳：用于区分冷启动假 401 与真的登录态失效 */
+	let authFailAt = 0
+
+	/** 鉴权类错误：token 失效 / 未授权，需要重新登录 */
+	function isAuthError(msg: string): boolean {
+		return msg.indexOf('401') >= 0 ||
+			msg.indexOf('5001') >= 0 ||
+			msg.indexOf('未授权') >= 0 ||
+			msg.indexOf('鉴权') >= 0 ||
+			msg.indexOf('token') >= 0 ||
+			msg.indexOf('Token') >= 0
+	}
+
+	/**
+	 * 清掉本地登录态并回到设置页。
+	 *
+	 * 这里**不**置 skipAuto：token 过期只是登录态过期，账号密码还在本地，
+	 * 让登录页用保存的凭据自动重登一次（web 端 dev server 也会先静默续期），
+	 * 用户就不用重新手输。防抖交给登录页的 allowAutoLogin()（60 秒内最多 3 次），
+	 * 避免密码真的失效时两个页面来回闪。
+	 */
+	function redirectToLogin() {
+		if (redirecting) {
+			return
+		}
+		// 冷启动 / 从桌面重新进 App 时，**第一次请求有可能还没带上 token**（插件初始化竞态），
+		// 这一下 401 是假的：直接跳登录页会「闪一下登录页又回首页」（2026-11-24 用户反馈）。
+		// 规则：5 秒内的**第一次** 401 只显示错误、不跳转；再来一次才认为真的失效。
+		const now = Date.now()
+		if (now - authFailAt > 5000) {
+			authFailAt = now
+			return
+		}
+		redirecting = true
+		stopTvKeyHook(keyHook)
+		logout()
+		uni.reLaunch({ url: '/pages/index/index' })
+	}
+
+	/** 统一的失败处理：鉴权类错误直接退出，其余只显示提示 */
+	function failWith(msg: string) {
+		errorText.value = msg
+		if (isAuthError(msg)) {
+			redirectToLogin()
+		}
+	}
+
+	/** 0=周日；用算术算，避免依赖 Date 的时区行为。UTS 编译为局部函数，必须先定义后使用 */
+	function weekdayOf(y: number, m: number, d: number): string {
+		const table = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4]
+		const yy = m < 3 ? y - 1 : y
+		const w = (yy + Math.floor(yy / 4) - Math.floor(yy / 100) + Math.floor(yy / 400) + table[m - 1] + d) % 7
+		const names = ['周日', '周一', '周二', '周三', '周四', '周五', '周六']
+		return names[w]
+	}
+
+	/** 按「天」分组；接口本身是时间倒序，所以顺序追加即可 */
+	const groups = computed((): Array<DayGroup> => {
+		const out: Array<DayGroup> = []
+		const list = photos.value
+		let seen = 0
+		for (let i = 0; i < list.length; i++) {
+			const it = list[i]
+			const key = it.dt.substring(0, 10)
+			const last: DayGroup | null = out.length > 0 ? out[out.length - 1] : null
+			if (last != null && last.key == key) {
+				last.items.push({ photo: it, idx: seen, tag: videoTagText(it), live: showLiveTag(it) } as CellItem)
+				seen = seen + 1
+				continue
+			}
+			const y = parseInt(it.dt.substring(0, 4))
+			const m = parseInt(it.dt.substring(5, 7))
+			const d = parseInt(it.dt.substring(8, 10))
+			const firstOfMonth = last == null || last.year != y || last.month != m
+			out.push({
+				key: key,
+				year: y,
+				month: m,
+				label: m.toString() + '月' + d.toString() + '日 ' + weekdayOf(y, m, d),
+				// 月份标题带上年份，方便确认跳转是否落到了正确的时间
+				monthLabel: y.toString() + '年' + m.toString() + '月',
+				firstOfMonth: firstOfMonth,
+				items: [{ photo: it, idx: seen, tag: videoTagText(it), live: showLiveTag(it) } as CellItem]
+			} as DayGroup)
+			seen = seen + 1
+		}
+		return out
+	})
+
+	/**
+	 * 时间轴：所有年份的月份全部平铺展开（年一行 + 该年每个月一行）。
+	 * 节点总数约 60~80 个，超出可视高度，所以时间轴本身是可滚动的，
+	 * 高亮项变化时自动滚到中间位置。
+	 */
+	const railNodes = computed((): Array<RailNode> => {
+		const out: Array<RailNode> = []
+		const ys = years.value
+		const ms = months.value
+		for (let i = 0; i < ys.length; i++) {
+			const y = ys[i]
+			out.push({
+				key: 'y' + y.year.toString(),
+				label: y.year.toString() + '年',
+				isYear: true,
+				year: y.year,
+				month: 0,
+				offset: y.offset,
+				isActive: y.year == activeYear.value,
+				indent: false
+			} as RailNode)
+			for (let j = 0; j < ms.length; j++) {
+				const m = ms[j]
+				if (m.year != y.year) {
+					continue
+				}
+				out.push({
+					key: 'm' + y.year.toString() + '_' + m.month.toString(),
+					label: m.month.toString() + '月',
+					isYear: false,
+					year: m.year,
+					month: m.month,
+					offset: m.offset,
+					isActive: m.year == activeYear.value && m.month == activeMonth.value,
+					indent: true
+				} as RailNode)
+			}
+		}
+		return out
+	})
+
+	/**
+	 * 分组 id：把 "2023:12:31" 的冒号换成下划线。
+	 * id 里带冒号会让 scroll-into-view 匹配不到元素（冒号是选择器特殊字符）。
+	 */
+	function groupId(key: string): string {
+		let out = ''
+		for (let i = 0; i < key.length; i++) {
+			const ch = key.substring(i, i + 1)
+			out += ch == ':' ? '_' : ch
+		}
+		return 'g' + out
+	}
+
+	const activeIndex = computed((): number => {
+		const ns = railNodes.value
+		// 优先高亮当前月份，否则退回到年份行
+		for (let i = 0; i < ns.length; i++) {
+			const n = ns[i]
+			if (!n.isYear && n.isActive) {
+				return i
+			}
+		}
+		for (let i = 0; i < ns.length; i++) {
+			if (ns[i].isActive) {
+				return i
+			}
+		}
+		return 0
+	})
+
+	function railLabel(i: number): string {
+		const n = railNodes.value[i]
+		return n == null ? '' : n.label
+	}
+
+	function railLabelClass(i: number): string {
+		const n = railNodes.value[i]
+		if (n == null) {
+			return 'rail-label'
+		}
+		let cls = 'rail-label'
+		if (n.isYear) {
+			cls = cls + ' rail-label-year'
+		} else {
+			cls = cls + ' rail-label-month'
+		}
+		if (n.isActive) {
+			cls = cls + ' rail-label-on'
+		}
+		// 遥控器焦点所在行：文字反白加粗，否则只有一圈细描边，TV 上根本找不到光标
+		if (railFocus.value && i == railIndex.value) {
+			cls = cls + ' rail-label-focus'
+		}
+		return cls
+	}
+
+	/** 年份行的星：跟随高亮变蓝，否则和年份标签同色 */
+	function railStarTextClass(i: number): string {
+		const n = railNodes.value[i]
+		return (n != null && n.isActive) ? 'rail-star-on' : ''
+	}
+
+	function railItemClass(i: number): string {
+		const n = railNodes.value[i]
+		if (n == null) {
+			return 'rail-item'
+		}
+		let cls = 'rail-item'
+		if (n.isYear) {
+			cls = cls + ' rail-item-year'
+		} else {
+			cls = cls + ' rail-item-month'
+		}
+		// 高亮只改文字颜色，不加底色，避免出现蓝色胶囊框
+		if (railFocus.value && i == railIndex.value) {
+			cls = cls + ' rail-item-selected'
+		}
+		return cls
+	}
+
+	/**
+	 * 第 idx 张照片在滚动内容里的顶部 y（px）——`indexAtScroll` 的逆运算（不按行对齐）。
+	 * 遥控器光标跟随、"光标到屏幕底部才滚"都靠它。
+	 */
+	function topOfIndex(idx: number): number {
+		const gs = groups.value
+		let acc = gapPx()
+		let seen = 0
+		for (let i = 0; i < gs.length; i++) {
+			const g = gs[i]
+			const head = (g.firstOfMonth ? monthHeaderPx : 0.0) + dayHeaderPx
+			if (idx < seen + g.items.length) {
+				const rel = idx - seen
+				const row = Math.floor(rel / cols.value)
+				return acc + head + row * cellPx
+			}
+			const rows = Math.ceil(g.items.length / cols.value)
+			acc += head + rows * cellPx + groupGapPx
+			seen += g.items.length
+		}
+		return acc
+	}
+
+	async function loadMore() {
+		if (loading.value || atEnd.value) {
+			return
+		}
+		loading.value = true
+		try {
+			const p = await page(currentOffset, PAGE_SIZE)
+			if (!p.ok) {
+				failWith(p.error)
+				return
+			}
+			if (p.items.length == 0) {
+				atEnd.value = true
+				return
+			}
+			const next: Array<PhotoItem> = photos.value.slice()
+			for (let i = 0; i < p.items.length; i++) {
+				const it = p.items[i]
+				next.push({ id: it.id, dt: it.dt, cat: it.cat, w: it.w, h: it.h, live: it.live, thumb: it.thumb, medium: it.medium, original: it.original, name: it.name, video: it.video, duration: it.duration } as PhotoItem)
+			}
+			// **窗口上限**：以前只往后追加、从不丢头部，翻十几页就有上千个缩略图节点，
+			// 内存吃紧 → 越滑越卡、后面连封面都渲染不出来（2026-11-24 用户反馈）。
+			// 超了就从**头部**丢最早的那些（都在视口上方很远处），并把滚动位置按高度补偿。
+			const over = next.length - WINDOW_MAX
+			if (over > 0) {
+				const cutH = topOfIndex(over)
+				const kept: Array<PhotoItem> = []
+				for (let i = over; i < next.length; i++) {
+					kept.push(next[i])
+				}
+				photos.value = kept
+				startOffset = startOffset + over
+				cursorIdx.value = cursorIdx.value - over
+				if (cursorIdx.value < 0) {
+					cursorIdx.value = 0
+				}
+				currentScroll = currentScroll - cutH
+				if (currentScroll < 0.0) {
+					currentScroll = 0.0
+				}
+				scrollTop.value = currentScroll
+				lastScrollTop = currentScroll
+			} else {
+				photos.value = next
+			}
+			currentOffset += p.items.length
+			if (p.items.length < PAGE_SIZE) {
+				atEnd.value = true
+			}
+		} catch (e) {
+			failWith((e as Error).message)
+		} finally {
+			loading.value = false
+		}
+	}
+
+	/** 当前列表渲染出来的总高度（px），用于向上加载后补偿滚动位置 */
+	function contentHeight(): number {
+		const gs = groups.value
+		let acc = 0.0
+		for (let i = 0; i < gs.length; i++) {
+			const g = gs[i]
+			const rows = Math.ceil(g.items.length / cols.value)
+			acc += (g.firstOfMonth ? monthHeaderPx : 0.0) + dayHeaderPx + rows * cellPx + groupGapPx
+		}
+		return acc
+	}
+
+	// ---------------- 滚动定位 ----------------
+	// 真机上「内容变化」和「scroll-top 生效」不在同一帧：只在 microtask 里设一次，
+	// 常常被丢弃或按旧内容高度钳制。于是插入头部的照片会先露出来
+	// （看着像「先跳到上一个时间的第一页，再跳回来」），跳转落点也会偏。
+	// 这里在几帧内重申同一个位置；而且值相同时 uvue 不会重新下发 scroll-top 属性，
+	// 所以每轮先设 target+1 再设 target，靠这 1px 抖动强制触发。
+
+	/** 滚动定位指令序号：新的定位 / 用户主动滚动都会让旧的重申作废 */
+	let scrollCmd = 0
+	/** onScroll 诊断日志节流时间戳（真机上要确认 scroll 事件到底回不回传） */
+	let lastScrollLog = 0
+	/** 高亮诊断日志节流时间戳 */
+	let lastActiveLog = 0
+
+
+	function resendScrollTop(target: number, cmd: number) {
+		// 固定排 5 轮（约 30~280ms）：不写递归，避免 UTS 局部函数自引用的编译风险。
+		// 真机上内容重建后第一次 scroll-top 常被丢掉，隔一帧再设才吃得上，
+		// 所以窗口给足；用户中途按键会通过 scrollCmd 立刻作废，不会拽住他不放
+		const delays: Array<number> = [30, 80, 130, 200, 280]
+		for (let i = 0; i < delays.length; i++) {
+			const delay = delays[i]
+			setTimeout(() => {
+				if (cmd != scrollCmd) {
+					return
+				}
+				// 不要在这里按「当前位置和目标差太多」放弃：真机上位置差本来就来自
+				// scroll-top 没生效，拿它当退出条件会让重调整段失效。
+				// 用户主动滚动的作废交给 scrollBy 里的 scrollCmd++。
+				scrollTop.value = target + 1.0
+				setTimeout(() => {
+					if (cmd != scrollCmd) {
+						return
+					}
+					scrollTop.value = target
+					currentScroll = target
+					lastScrollTop = target
+				}, 8)
+			}, delay)
+		}
+	}
+
+	/** 立刻把 scroll-view 定位到 target（px），并保证它在真机上真的生效 */
+	function applyScrollTop(target: number) {
+		scrollCmd = scrollCmd + 1
+		const cmd = scrollCmd
+		scrollTop.value = target
+		currentScroll = target
+		lastScrollTop = target
+		resendScrollTop(target, cmd)
+	}
+
+
+	/** 第 idx 行的实际高度（px）：年份行比月份行高，必须与 CSS 里的 height 对应 */
+	function railRowPx(i: number): number {
+		const n = railNodes.value[i]
+		return (n != null && n.isYear) ? RAIL_YEAR_RPX * unit : RAIL_MONTH_RPX * unit
+	}
+
+	/**
+	 * 把时间轴滚到第 idx 项：**只在它要出可视区时才滚，且只滚到刚好可见**。
+	 *
+	 * 以前是「固定让目标行上方留 10 行」：真机上表现为按一下上/下，时间轴整块跳一大截
+	 * （用户反馈「不先按到最顶上就直接往下翻会翻很大一截」）。
+	 * 可视高度按网格区高度估算（时间轴和网格同高）。
+	 */
+	function scrollRailTo(idx: number) {
+		if (idx < 0) {
+			return
+		}
+		let off = 0.0
+		for (let i = 0; i < idx; i++) {
+			off += railRowPx(i)
+		}
+		const h = railRowPx(idx)
+		const cur = railScrollTop.value
+		const view = viewportPx
+		const pad = railItemPx * 1.5
+		let target = cur
+		if (off - pad < cur) {
+			target = off - pad
+		} else if (off + h + pad > cur + view) {
+			target = off + h + pad - view
+		}
+		if (target < 0.0) {
+			target = 0.0
+		}
+		if (Math.abs(target - cur) < 0.5) {
+			return
+		}
+		railScrollTop.value = target
+	}
+
+	/** 时间轴跟随当前高亮滚动 */
+	function syncRailScroll() {
+		scrollRailTo(activeIndex.value)
+	}
+
+	/** 按日期把时间轴高亮设到对应的年 / 月 */
+	function setActiveByDate(dt: string) {
+		const y = parseInt(dt.substring(0, 4))
+		const m = parseInt(dt.substring(5, 7))
+		if (activeYear.value != y || activeMonth.value != m) {
+			activeYear.value = y
+			activeMonth.value = m
+			syncRailScroll()
+		}
+	}
+
+	/**
+	 * 让光标那一张可见：**只有它要出视口时才滚动**（用户口径：光标先动、到边才翻页）。
+	 * 同时把时间轴高亮跟过去。
+	 *
+	 * 注意这里用「直接设 scroll-top」而不是 `applyScrollTop`（那个是给跳转用的
+	 * 5 轮重申，一次按键排 10 个定时器，长按时会把真机拖卡）。
+	 */
+	function moveCursorIntoView() {
+		const n = photos.value.length
+		if (n == 0) {
+			return
+		}
+		if (cursorIdx.value < 0) {
+			cursorIdx.value = 0
+		}
+		if (cursorIdx.value >= n) {
+			cursorIdx.value = n - 1
+		}
+		const p = photos.value[cursorIdx.value]
+		if (p != null) {
+			// 时间轴高亮跟着光标，不再跟「视口顶部那张」
+			setActiveByDate(p.dt)
+		}
+		const top = topOfIndex(cursorIdx.value)
+		const pad = cellPx * 0.25
+		let need = false
+		let target = currentScroll
+		if (top - pad < currentScroll) {
+			target = top - pad
+			need = true
+		} else if (top + cellPx + pad > currentScroll + viewportPx) {
+			target = top + cellPx + pad - viewportPx
+			need = true
+		}
+		if (!need) {
+			return
+		}
+		if (target < 0.0) {
+			target = 0.0
+		}
+		if (Math.abs(target - currentScroll) < 0.5) {
+			return
+		}
+		// 锁 300ms：这段内的 scroll 回调不算「用户滚动」，不要把光标反推回去
+		cursorLockUntil = Date.now() + 300
+		// 真机上「值没变」时不会重新下发 scroll-top，先用 +1 抖一下再给真值（比 applyScrollTop 的 5 轮便宜得多）
+		scrollTop.value = target + 1.0
+		currentScroll = target
+		lastScrollTop = target
+		setTimeout(() => {
+			scrollTop.value = target
+		}, 12)
+		libLog('[lib] cursor=' + cursorIdx.value.toString() + ' top=' + top.toString() + ' scroll=' + target.toString())
+	}
+
+	/**
+	 * 向上加载一页（更晚的日期）。插入列表头部后按高度差补偿 scrollTop，
+	 * 保证用户眼前那张照片不动，否则一加载就会跳。
+	 */
+	async function loadPrev() {
+		if (loadingPrev) {
+			// 上一页还没回来就又被触发（连按上键 / 滚动回调）：记一笔，结束后自动补一次。
+			// 直接丢弃的话，快速连按时用户会觉得「按了没反应」，得再按一次
+			prevPending = true
+			return
+		}
+		if (loading.value || startOffset <= 0) {
+			pendingCursorUp = false
+			return
+		}
+		loadingPrev = true
+		libLog('[lib] loadPrev startOffset=' + startOffset.toString() + ' photos=' + photos.value.length.toString())
+		try {
+			const from = startOffset > PAGE_SIZE ? startOffset - PAGE_SIZE : 0
+			const limit = startOffset - from
+			if (limit <= 0) {
+				return
+			}
+			const before = contentHeight()
+			const gapBefore = gapPx()
+			const p = await page(from, limit)
+			if (!p.ok) {
+				// 请求失败（超时 / 连接被掐）不能当成「已到最前」：
+				// 一旦误判成 atNewest，顶部留白会收起、startOffset 归零，
+				// 之后再怎么按上键都不会重试 —— 表现就是「有时候能加载，有时候按了没反应」
+				console.error('[library] loadPrev request failed: ' + p.error)
+				pendingCursorUp = false
+				return
+			}
+			if (p.items.length == 0) {
+				// 前面确实没有数据了：标记为已到最前，顶部留白收起
+				startOffset = 0
+				atNewest.value = true
+				pendingCursorUp = false
+				return
+			}
+			const merged: Array<PhotoItem> = []
+			for (let i = 0; i < p.items.length; i++) {
+				const it = p.items[i]
+				merged.push({ id: it.id, dt: it.dt, cat: it.cat, w: it.w, h: it.h, live: it.live, thumb: it.thumb, medium: it.medium, original: it.original, name: it.name, video: it.video, duration: it.duration } as PhotoItem)
+			}
+			const old = photos.value
+			for (let i = 0; i < old.length; i++) {
+				merged.push(old[i])
+			}
+			photos.value = merged
+			startOffset = from
+			atNewest.value = from <= 0
+			// 光标跟着内容一起往下挪，保持「还是同一张照片」
+			// （否则补一页之后光标会突然指到别的照片上，OK 打开错的图）
+			cursorIdx.value = cursorIdx.value + p.items.length
+			// 上方插入内容后内容变高，滚动位置要跟着走，否则一加载就跳。
+			// 两个口径：
+			//   1) 一般情况：保持用户眼前那张照片不动（next = 当前位置 + 新增高度）；
+			//   2) 用户已经在列表顶部：让新照片直接填满视口（next = 新内容末尾 − 一屏）。
+			//      这时再「保持原位」只会把他按在空白 + 年月标题上，滑了像没滑（真机反馈「卡住」）
+			const delta = contentHeight() - before
+			const shrink = gapBefore - gapPx()
+			if (!suppressCompensate) {
+				let next = 0.0
+				if (currentScroll < gapPx() + cellPx * 2.0) {
+					next = gapPx() + delta - viewportPx
+					if (next < gapPx()) {
+						next = gapPx()
+					}
+				} else {
+					next = currentScroll + delta - shrink
+					if (next < 0.0) {
+						next = 0.0
+					}
+				}
+				// 清掉跳转锚点：补页时若框架重新套用旧锚点，会把视口拽回跳转目标
+				scrollIntoId.value = ''
+				libLog('[lib] loadPrev items=' + p.items.length.toString() + ' delta=' + delta.toString() + ' next=' + next.toString())
+				applyScrollTop(next)
+			}
+			// 遥控器在第一行按上触发的补页：补完再把光标往上挪一行，
+			// 落在刚插进来的那批照片里（用户按上是为了「看到更新的照片」）
+			if (pendingCursorUp) {
+				pendingCursorUp = false
+				const up = cursorIdx.value - cols.value
+				cursorIdx.value = up < 0 ? 0 : up
+				moveCursorIntoView()
+			}
+			// **窗口上限**：向上翻页同样会无限增长（以前只前插、从不丢弃），
+			// 翻十几页就攒上千个缩略图节点 → 越滑越卡、缩略图渲染不出来（2026-11-24 反馈）。
+			// 必须放在上面的滚动补偿之后：先裁剪会让 `delta` 偏小、视口跳动；
+			// 而被丢掉的都在视口下方很远处，不影响当前画面。
+			const tooMany = photos.value.length - WINDOW_MAX
+			if (tooMany > 0) {
+				const keptTail: Array<PhotoItem> = []
+				for (let i = 0; i < WINDOW_MAX; i++) {
+					keptTail.push(photos.value[i])
+				}
+				photos.value = keptTail
+				// 尾部没了，就不再是「到底」状态，否则再往下滑不会补页
+				atEnd.value = false
+			}
+		} catch (e) {
+			// 向上加载失败一般保持现状，但鉴权失效必须退出重登
+			const msg = (e as Error).message
+			console.error('[library] loadPrev failed: ' + msg)
+			if (isAuthError(msg)) {
+				redirectToLogin()
+			}
+		} finally {
+			loadingPrev = false
+			if (prevPending) {
+				prevPending = false
+				// 必须等这一页的滚动补偿（重申到 280ms）落定再补下一页：
+				// 否则两次插入的补偿互相踩，视口会差几十像素（真机日志实测 72px），
+				// 表现为「补完一页位置略微偏一点」
+				setTimeout(() => {
+					loadPrev()
+				}, 400)
+			}
+		}
+	}
+
+	/**
+	 * 到达已加载窗口顶部时补上一页。
+	 *
+	 * 必须独立于 `onScroll` 的高亮锁定（pinnedTop / pinGuard）：
+	 * jumpTo 的落点就在顶部留白之后（top ≈ gapPx()），用户往上滑最多把它推到 0，
+	 * 位移不到半个格子，永远出不了 48px 的锁定区 —— 如果补页判定跟在锁定 return 后面，
+	 * 就会发现「跳转后往上滑没反应，先往下翻一下再往上翻才加载」。
+	 */
+	function maybeLoadPrev(top: number, goingUp: boolean) {
+		if (!goingUp || atNewest.value || viewerOpen.value || loadingPrev || loading.value) {
+			return
+		}
+		if (startOffset <= 0) {
+			return
+		}
+		if (Date.now() < prevGuard) {
+			return
+		}
+		// 提前一屏就开始补：等用户真的滑到顶时新照片已经在了，
+		// 他就不会停在「prev-gap 空白 + 年月标题」那个断裂处（真机截图里的那片空白）。
+		// 之前是 gapPx()+120（几乎贴到顶才补），补页总是在用户看见顶部之后才回来。
+		if (top < viewportPx) {
+			loadPrev()
+		}
+	}
+
+	/**
+	 * 把内容补到「超过一屏」。
+	 *
+	 * scroll-view 的内容比视口矮时没有可滚范围，连 scroll 事件都不会产生，
+	 * 靠滚动触发的 loadPrev 就永远跑不到 —— 典型场景是跳转到全库最早的那个月
+	 * （只剩几张照片），此时按上键毫无反应。这里主动往前补页，
+	 * 保证跳转后的列表至少有一屏多的内容，向上滚动才有可滚余量和补页触发点。
+	 */
+	async function fillViewport() {
+		suppressCompensate = true
+		try {
+			for (let i = 0; i < 10; i++) {
+				if (startOffset <= 0) {
+					return
+				}
+				if (contentHeight() + gapPx() >= viewportPx) {
+					return
+				}
+				const before = startOffset
+				await loadPrev()
+				// 没再往前取到数据（已到顶），避免死循环
+				if (startOffset >= before) {
+					return
+				}
+			}
+		} finally {
+			suppressCompensate = false
+		}
+	}
+
+	/** 滚动位置 → 已加载列表里的照片索引（按行对齐，落在该行第一张） */
+	function indexAtScroll(top: number): number {
+		const gs = groups.value
+		// 内容最前面有一段顶部留白（到达最前时收起），累计高度要从它之后算起
+		let acc = gapPx()
+		let seen = 0
+		for (let i = 0; i < gs.length; i++) {
+			const g = gs[i]
+			const rows = Math.ceil(g.items.length / cols.value)
+			const head = (g.firstOfMonth ? monthHeaderPx : 0.0) + dayHeaderPx
+			const h = head + rows * cellPx + groupGapPx
+			if (top < acc + h) {
+				const rel = top - acc - head
+				const row = rel <= 0 ? 0 : Math.floor(rel / cellPx)
+				const idx = seen + row * cols.value
+				const last = seen + g.items.length - 1
+				return idx > last ? last : idx
+			}
+			acc += h
+			seen += g.items.length
+		}
+		return 0
+	}
+
+
+	/**
+	 * 高亮跟着「视口顶部那张照片」走，而不是按像素区间归属分组。
+	 * 像素区间在分组交界处容易差一像素就把高亮判给上一组（点 6 月显示 7 月）。
+	 *
+	 * 取样点要往下偏 0.7 个格子：向上补页后视口顶部常常只露出上一行照片的最后
+	 * 二三十像素（补偿量决定了这一点），如果按「顶部那一个像素」取，
+	 * 高亮会提前跳到那一行所属的月份 —— 真机日志里就是 top=1553.8、idx=59
+	 * 判定成 2026-01-01，而屏幕上整屏还是 2025-12-31 的照片。
+	 * 0.7 格子的含义：只露出个边角的照片不算「视口顶部那张」。
+	 */
+	function updateActive(top: number) {
+		const probe = top + cellPx * 0.7
+		const idx = indexAtScroll(probe)
+		const p = photos.value[idx]
+		if (p == null) {
+			return
+		}
+		// 选中框与时间轴高亮同一个取样点：正常情况下两者永远指向同一张
+		cursorIdx.value = idx
+		// 诊断：确认「视口顶部那张」到底是哪天，和时间轴高亮对不对得上
+		const now = Date.now()
+		if (now - lastActiveLog > 300) {
+			lastActiveLog = now
+			libLog('[lib] active top=' + top.toString() + ' probe=' + probe.toString() + ' idx=' + idx.toString() + ' dt=' + p.dt)
+		}
+		setActiveByDate(p.dt)
+	}
+
+	/**
+	 * 跳转到全库第 offset 张。
+	 *
+	 * 列表直接从目标开始、停在顶部（scrollTop = 0），一帧到位：
+	 * 不做「预载上一页再滚过去」——那会先渲染上个月、且跳到全库末尾时
+	 * 第二次补页会因 atEnd 被跳过，导致定位失效。
+	 * 想回看更早的照片，用时间轴选上个月，或遥控器上键（会触发 loadPrev）。
+	 */
+	async function jumpTo(offset: number) {
+		const from = offset < 0 ? 0 : offset
+		photos.value = []
+		atEnd.value = false
+		errorText.value = ''
+		currentOffset = from
+		startOffset = from
+		atNewest.value = from <= 0
+		// 定位刚落位的几百毫秒内不补页，避免自己设置的 scrollTop 被当成用户上滑。
+		// 只留 250ms：跳转后用户往往马上就按上键想看更早的，留太长会「第一下没反应」。
+		prevGuard = Date.now() + 250
+		// 旧列表的补页请求已经没意义，别让 finally 里的续补把新列表顶走
+		prevPending = false
+		pinnedTop = -1.0
+		// 作废还在重申中的上一次定位，否则它会把新列表又拽回旧位置
+		scrollCmd = scrollCmd + 1
+		scrollTop.value = 0
+		currentScroll = 0
+		lastScrollTop = 0
+		await loadMore()
+		// 目标月份可能只剩几张（全库最早的月份就是这样），内容不足一屏时
+		// scroll-view 根本没有可滚范围，向上补页永远触发不了，这里先补满一屏
+		const head = photos.value[0]
+		const beforeFill = contentHeight()
+		await fillViewport()
+		const filled = contentHeight() - beforeFill
+		// 高亮按目标月份第一张算（补页之后 photos[0] 已经不是它了）
+		if (head != null) {
+			setActiveByDate(head.dt)
+		} else {
+			updateActive(0)
+		}
+		// 目标月份第一张要落在视口顶部：滚过顶部留白 + 补进来的内容。
+		// 末尾月份下面的内容不足一屏，浏览器会把它钳制到最大滚动值，
+		// 这里先按同样规则算好，否则 currentScroll 和真实位置不一致会让上/下键失灵
+		const contentPx = contentHeight()
+		const maxTop = gapPx() + contentPx - viewportPx
+		let top = gapPx() + filled
+		if (maxTop >= 0.0 && top > maxTop) {
+			top = maxTop
+		}
+		pinnedTop = top
+		// 只遮住定位回调自己产生的 scroll（几十毫秒级），别挡住用户马上按的上/下键
+		pinGuard = Date.now() + 250
+		// 跨帧重申：真机上内容刚重建时第一次设置的 scroll-top 常被丢弃，
+		// 落点会停在 0（看着像跳到目标时间的头一张，然后才定位到正确位置）
+		applyScrollTop(top)
+		// 选中框按落点算（applyScrollTop 之后 currentScroll 才是新位置）
+		cursorIdx.value = indexAtScroll(top)
+		// 主力落点：原生滚动到「目标那天的分组」。它只认元素 id，不依赖像素估算
+		// 和 scroll-top 的生效时序，是这套里唯一不靠「猜高度」的定位方式。
+		// 锚点必须在渲染完成后设，设完再清空 —— 否则后续插入补页内容时
+		// 框架会重新套用旧锚点，把用户刚从顶部滑出来的位置又拽回去。
+		if (head != null) {
+			const gid = groupId(head.dt.substring(0, 10))
+			setTimeout(() => {
+				scrollIntoId.value = gid
+				libLog('[lib] jumpTo offset=' + from.toString() + ' top=' + top.toString() + ' anchor=' + gid)
+			}, 50)
+			setTimeout(() => {
+				scrollIntoId.value = ''
+			}, 450)
+		}
+	}
+
+	async function init() {
+		loading.value = true
+		try {
+			const tl = await timeline()
+			if (!tl.ok) {
+				failWith(tl.error)
+				loading.value = false
+				return
+			}
+			total.value = tl.total
+			const ys: Array<YearItem> = []
+			for (let i = 0; i < tl.years.length; i++) {
+				const y = tl.years[i]
+				ys.push({ year: y.year, offset: y.offset } as YearItem)
+			}
+			years.value = ys
+			const ms: Array<MonthItem> = []
+			for (let i = 0; i < tl.months.length; i++) {
+				const m = tl.months[i]
+				ms.push({ year: m.year, month: m.month, offset: m.offset } as MonthItem)
+			}
+			months.value = ms
+			if (ys.length > 0) {
+				activeYear.value = ys[0].year
+				activeMonth.value = 0
+				railIndex.value = 0
+			}
+		} catch (e) {
+			errorText.value = (e as Error).message
+			loading.value = false
+			return
+		}
+		loading.value = false
+		await jumpTo(years.value.length > 0 ? years.value[0].offset : 0)
+	}
+
+	/**
+	 * 右上角切换每行张数。
+	 * 以「光标那一张」为锚点重新请求，而不是这一页的开头，
+	 * 否则多点几次就会跳到别的年份；scroll-view 用 :key="cols" 强制重建，保证滚动复位。
+	 */
+	async function setCols(n: number) {
+		libLog('[lib] setCols n=' + n.toString() + ' from=' + cols.value.toString() + ' cursor=' + cursorIdx.value.toString())
+		if (n == cols.value) {
+			return
+		}
+		const start = currentOffset - photos.value.length
+		const target = start + cursorIdx.value
+		cols.value = n
+		cellPx = (cellSizeRpx(n) + CELL_MARGIN_RPX) * unit
+		await jumpTo(target < 0 ? 0 : target)
+		libLog('[lib] setCols done cols=' + cols.value.toString() + ' photos=' + photos.value.length.toString())
+	}
+
+	/** 某个列数在 COL_OPTIONS 里的下标 */
+	function colIndexOf(n: number): number {
+		for (let i = 0; i < COL_OPTIONS.length; i++) {
+			if (COL_OPTIONS[i] == n) {
+				return i
+			}
+		}
+		return 1
+	}
+
+	/** 进入右上角布局切换区 */
+	function enterLayoutFocus() {
+		layoutFocus.value = true
+		layoutIndex.value = colIndexOf(cols.value)
+		libLog('[lib] enter layout focus index=' + layoutIndex.value.toString() + ' cols=' + cols.value.toString())
+	}
+
+	/** 鼠标/触屏直接点某一档 */
+	function onColClick(i: number) {
+		layoutIndex.value = i
+		setCols(COL_OPTIONS[i])
+	}
+
+	/** 按钮样式：生效档位绿色实底，焦点档位绿色描边 */
+	function colBtnClass(i: number): string {
+		const isOn = COL_OPTIONS[i] == cols.value
+		const isFocus = layoutFocus.value && i == layoutIndex.value
+		if (isOn && isFocus) {
+			return 'col-btn-on col-btn-focus'
+		}
+		if (isFocus) {
+			return 'col-btn-focus'
+		}
+		if (isOn) {
+			return 'col-btn-on'
+		}
+		return ''
+	}
+
+	function colTextClass(i: number): string {
+		if (COL_OPTIONS[i] == cols.value) {
+			return 'col-btn-text-on'
+		}
+		if (layoutFocus.value && i == layoutIndex.value) {
+			return 'col-btn-text-focus'
+		}
+		return ''
+	}
+
+	/**
+	 * 网格选中样式（直接加在格子自身）：
+	 * 焦点在网格 = 亮蓝边框；焦点跑到时间轴 / 布局条 / 导航栏 = 灰边框。
+	 * 两处同时亮会让人分不清「现在按方向键会动哪一块」。
+	 */
+	function cellClass(idx: number): string {
+		if (idx != cursorIdx.value) {
+			return ''
+		}
+		const idle = railFocus.value || layoutFocus.value || navIndex.value >= 0
+		return idle ? 'cell-focus-idle' : 'cell-focus'
+	}
+
+	/**
+	 * 导航栏分区标签：0 = 首页（reLaunch 回大屏），1 = 图库（本页），2 = 相册。
+	 * 图库 ↔ 相册用 redirectTo 而不是 navigateTo：栈里只留一个内容页，
+	 * 反复切换时不会把多份 grid / 查看器实例留在内存里；
+	 * 回首页用 reLaunch，首页不保留在图库下面（首页自己没有栈需求）。
+	 */
+	function onNavClick(i: number) {
+		if (i == 0) {
+			stopTvKeyHook(keyHook)
+			uni.reLaunch({ url: '/pages/home/home' })
+		} else if (i == 2) {
+			stopTvKeyHook(keyHook)
+			uni.redirectTo({ url: '/pages/album/album' })
+		}
+	}
+
+	/** 导航栏「设置」：进设置页（navigateTo，返回键回图库；退出登录在设置页里） */
+	function onOpenSettings() {
+		stopTvKeyHook(keyHook)
+		uni.navigateTo({ url: '/pages/settings/settings' })
+	}
+
+	/** 导航栏「搜索」：进搜索页（navigateTo，返回键 / × 回图库） */
+	function onOpenSearch() {
+		stopTvKeyHook(keyHook)
+		uni.navigateTo({ url: '/pages/search/search' })
+	}
+
+	function onScroll(e: UniScrollEvent) {
+		const top = e.detail.scrollTop
+		const now = Date.now()
+		if (now - lastScrollLog > 400) {
+			lastScrollLog = now
+			libLog('[lib] onScroll top=' + top.toString() + ' model=' + currentScroll.toString())
+		}
+		// 注意：这里不再做「补偿保护 / 视图回推」。真机上会表现为
+		// 「慢慢往上滑突然推不动」——因为模型和实际位置一旦差开，
+		// 每次回调都在把视图拽回模型。实际位置永远以 scroll 回调为准。
+		// 只有「向上滚」才补数据：向下滚到底部附近不该触发，否则插入内容会把它顶开
+		const goingUp = top < lastScrollTop - 4
+		// 「自己滚出来的回声」：位置和模型一致（±4px）就不算用户滚动，
+		// 否则长按时光标会被反复反推回视口顶部（真机反馈「光标乱跳 / 消失」）
+		const echo = Math.abs(top - currentScroll) <= 4.0
+		lastScrollTop = top
+		currentScroll = top
+		// 刚由 jumpTo 定位完的回调不算用户滚动：末尾月份的内容不足一屏，
+		// 浏览器会把位置钳制到最大滚动值（和算出来的目标差几十像素），
+		// 拿它去算高亮会把刚选中的末月抢成上一批照片的月份
+		if (pinnedTop >= 0.0) {
+			// 只按时间窗判断「这次回调是定位自己引起的」。
+			// 原来还要求位置差 > 48px 才解锁，而跳转落点紧贴顶部留白，
+			// 用户往上滑整段都到不了 48px，高亮就一直卡在旧的月份；
+			// 补页时同理。真机定位回调在几十毫秒内就回来了，等它过即可。
+			if (Date.now() < pinGuard) {
+				maybeLoadPrev(top, goingUp)
+				return
+			}
+			pinnedTop = -1.0
+		}
+		// 光标引起的滚动（时间窗内 / 位置和模型一致）：不反推光标
+		if (Date.now() < cursorLockUntil || echo) {
+			return
+		}
+		// 用户自己滚（web 滚轮 / 拖动）：光标钉到视口顶部那张，并同步时间轴高亮
+		updateActive(top)
+		maybeLoadPrev(top, goingUp)
+	}
+
+	function onLower() {
+		loadMore()
+	}
+
+	function onRailClick(i: number) {
+		const n = railNodes.value[i]
+		if (n == null) {
+			return
+		}
+		railFocus.value = false
+		jumpTo(n.offset)
+	}
+
+	/**
+	 * 保证全库下标 target 对应的照片已经在 photos 窗口里。
+	 * 往更早翻要 loadPrev（插入头部，之后必须用 target - startOffset 重算索引），
+	 * 往更新翻要 loadMore（追加，窗口内下标不受影响）。
+	 * 返回 false = 已到全库两端或加载失败。
+	 */
+	async function ensureLoaded(target: number): Promise<boolean> {
+		if (target < 0) {
+			return false
+		}
+		if (target >= startOffset && target < currentOffset) {
+			return true
+		}
+		if (target < startOffset) {
+			while (target < startOffset && startOffset > 0) {
+				const before = startOffset
+				await loadPrev()
+				if (startOffset == before) {
+					break
+				}
+			}
+			return target >= startOffset
+		}
+		while (target >= currentOffset && !atEnd.value) {
+			const before = currentOffset
+			await loadMore()
+			if (currentOffset == before) {
+				return false
+			}
+		}
+		return target < currentOffset
+	}
+
+	/**
+	 * 追赶 viewerTarget：逐张跨页补数据并显示。
+	 * 连按左右键时 viewerTarget 会被累加，这里只按最终目标移动，不会一张张排队。
+	 */
+	async function moveViewer() {
+		const session = viewerSession
+		while (viewerOpen.value && session == viewerSession && viewerTarget != viewerOffset) {
+			const target = viewerTarget
+			const ok = await ensureLoaded(target)
+			if (!viewerOpen.value || session != viewerSession) {
+				return
+			}
+			if (!ok) {
+				// 到全库两端了：停在当前这张
+				viewerTarget = viewerOffset
+				break
+			}
+			const idx = target - startOffset
+			if (idx < 0 || idx >= photos.value.length) {
+				viewerTarget = viewerOffset
+				break
+			}
+			viewerOffset = target
+			// 只改下标：图片 / 视频 / 实况的加载与销毁都在 PhotoViewer 组件里
+			viewerIndex.value = idx
+		}
+		if (session == viewerSession) {
+			viewerMoving = false
+			viewerTarget = viewerOffset
+		}
+	}
+
+	function requestStep(delta: number) {
+		const base = viewerMoving ? viewerTarget : viewerOffset
+		const next = base + delta
+		viewerTarget = next < 0 ? 0 : next
+		if (!viewerMoving) {
+			viewerMoving = true
+			moveViewer()
+		}
+	}
+
+	function openViewer(idx: number) {
+		if (idx < 0 || idx >= photos.value.length) {
+			return
+		}
+		viewerOpen.value = true
+		// 覆盖层期间不让别处的焦点态残留
+		layoutFocus.value = false
+		railFocus.value = false
+		navIndex.value = -1
+		viewerSession = viewerSession + 1
+		viewerOffset = startOffset + idx
+		viewerTarget = viewerOffset
+		viewerMoving = false
+		viewerIndex.value = idx
+	}
+
+	/** 组件请求上一张 / 下一张：跨页补数据只有页面知道，统一走 requestStep */
+	function onViewerNav(delta: number) {
+		requestStep(delta)
+	}
+
+	function onCellClick(idx: number) {
+		openViewer(idx)
+	}
+
+	/**
+	 * 网格的行表：`[首张下标, 该行张数, 首张下标, 该行张数, ...]`。
+	 *
+	 * 网格是**按天分块**的（每天一个 `.cells`），组末不满一行时 `idx ± cols` 会跳到下一组的
+	 * 错位列上，所以上下移动必须按真实行表算（用户反馈「左右移动后上下错乱」的根因之一）。
+	 */
+	function buildRows(): Array<number> {
+		const out: Array<number> = []
+		const gs = groups.value
+		const c = cols.value
+		let seen = 0
+		for (let i = 0; i < gs.length; i++) {
+			const total = gs[i].items.length
+			let off = 0
+			while (off < total) {
+				const cnt = (total - off) < c ? (total - off) : c
+				out.push(seen + off)
+				out.push(cnt)
+				off += cnt
+			}
+			seen += total
+		}
+		return out
+	}
+
+	/** 同一列上下移动一行；`dir` = -1 上 / 1 下。越界返回 -1 */
+	function moveRowIndex(idx: number, dir: number): number {
+		const rows = buildRows()
+		let ri = -1
+		let col = 0
+		for (let i = 0; i < rows.length; i += 2) {
+			const start = rows[i]
+			const cnt = rows[i + 1]
+			if (idx >= start && idx < start + cnt) {
+				ri = i / 2
+				col = idx - start
+				break
+			}
+		}
+		if (ri < 0) {
+			return -1
+		}
+		const tr = ri + dir
+		const rowCount = rows.length / 2
+		if (tr < 0 || tr >= rowCount) {
+			return -1
+		}
+		const tStart = rows[tr * 2]
+		const tCnt = rows[tr * 2 + 1]
+		return tStart + (col < tCnt ? col : tCnt - 1)
+	}
+
+	/**
+	 * 右键的目标下标；返回 -1 = 该进时间轴了。
+	 *
+	 * 规则（2026-11-24 用户口径，最终版）：**只要光标在「本行的最后一张」就进时间轴**，
+	 * 不看这一行是不是排满。
+	 *
+	 * 之前中间版本要求「排满一整行」才算行末，于是「当天只有 1 张照片」的行按右会顺延到下一张，
+	 * 用户的原话是「这一行的最后一张就应该能进时间轴」——那张既是第一张也是最后一张，所以照样进。
+	 */
+	function rightTarget(idx: number): number {
+		const rows = buildRows()
+		for (let i = 0; i < rows.length; i += 2) {
+			const start = rows[i]
+			const cnt = rows[i + 1]
+			if (idx >= start && idx < start + cnt) {
+				return (idx - start) < cnt - 1 ? idx + 1 : -1
+			}
+		}
+		return -1
+	}
+
+	/** 跳到导航栏第 i 个入口（0 首页 / 1 图库 / 2 相册 / 3 搜索 / 4 设置） */
+	function gotoNav(i: number) {
+		navIndex.value = -1
+		if (i == 3) {
+			onOpenSearch()
+		} else if (i == 4) {
+			onOpenSettings()
+		} else if (i == 0 || i == 2) {
+			onNavClick(i)
+		}
+		// i == 1 是当前页（图库），不重复跳
+	}
+
+	/** 层「library.nav」：导航栏焦点（栈顶覆盖层）。返回键在这里 = 离开本页 */
+	function onNavKey(code: number): boolean {
+		if (code == KEY_LEFT) {
+			navIndex.value = (navIndex.value + NAV_COUNT - 1) % NAV_COUNT
+		} else if (code == KEY_RIGHT) {
+			navIndex.value = (navIndex.value + 1) % NAV_COUNT
+		} else if (code == KEY_OK || code == KEY_ENTER) {
+			gotoNav(navIndex.value)
+		} else if (code == KEY_DOWN) {
+			navIndex.value = -1
+		} else if (code == KEY_BACK) {
+			navIndex.value = -1
+			stopTvKeyHook(keyHook)
+			uni.reLaunch({ url: '/pages/home/home' })
+		}
+		return true
+	}
+
+	/**
+	 * 层「library.layout」：每行张数切换条（覆盖层，吞掉所有键）。
+	 * 左右改档位（立即生效便于预览），返回 / 下键退回时间轴。
+	 */
+	function onLayoutKey(code: number): boolean {
+		if (code == KEY_LEFT) {
+			if (layoutIndex.value > 0) {
+				layoutIndex.value = layoutIndex.value - 1
+				setCols(COL_OPTIONS[layoutIndex.value])
+			}
+		} else if (code == KEY_RIGHT) {
+			if (layoutIndex.value < COL_OPTIONS.length - 1) {
+				layoutIndex.value = layoutIndex.value + 1
+				setCols(COL_OPTIONS[layoutIndex.value])
+			}
+		} else if (code == KEY_BACK || code == KEY_DOWN) {
+			layoutFocus.value = false
+			railFocus.value = true
+		}
+		return true
+	}
+
+	/** 层「library.rail」：右侧年月时间轴（覆盖层，吞掉所有键） */
+	function onRailKey(code: number): boolean {
+		if (railNodes.value.length == 0) {
+			railFocus.value = false
+			return true
+		}
+		const last = railNodes.value.length - 1
+		if (code == KEY_UP) {
+			if (railIndex.value == 0) {
+				// 已经在最顶上的年份，再按上进入布局切换
+				railFocus.value = false
+				enterLayoutFocus()
+				return true
+			}
+			railIndex.value = railIndex.value - 1
+			scrollRailTo(railIndex.value)
+		} else if (code == KEY_DOWN) {
+			railIndex.value = railIndex.value < last ? railIndex.value + 1 : last
+			scrollRailTo(railIndex.value)
+		} else if (code == KEY_OK || code == KEY_ENTER) {
+			onRailClick(railIndex.value)
+		} else if (code == KEY_LEFT || code == KEY_BACK) {
+			railFocus.value = false
+		}
+		return true
+	}
+
+	/**
+	 * 层「library.grid」：基础层，只认网格自己的键，其余交回上层。
+	 *
+	 * 模型（2026-11-22 用户口径）：
+	 *   上下 = 光标移动一行，出视口才滚；**左右 = 同一行内左右移动一张**（不再一按右键就跳时间轴）；
+	 *   行末再按右 → 进时间轴；**第一行再按上 → 焦点交给导航栏**（还有更新照片时先补页）；
+	 *   OK = 打开光标那张；**返回 = 先把焦点交给导航栏**，导航栏里再按返回才回首页。
+	 */
+	function onGridKey(code: number): boolean {
+		const n = photos.value.length
+		if (code == KEY_DOWN) {
+			if (n == 0) {
+				return false
+			}
+			const t = moveRowIndex(cursorIdx.value, 1)
+			if (t >= 0) {
+				cursorIdx.value = t
+				moveCursorIntoView()
+			} else {
+				// 已在最后一行：先补更晚的一页（光标停在原来那张，不跳）
+				if (!atEnd.value && !loading.value) {
+					loadMore()
+				}
+			}
+		} else if (code == KEY_UP) {
+			if (n == 0) {
+				navIndex.value = 1
+				return true
+			}
+			const t = moveRowIndex(cursorIdx.value, -1)
+			if (t >= 0) {
+				cursorIdx.value = t
+				moveCursorIntoView()
+			} else if (!atNewest.value && startOffset > 0) {
+				// 还有更晚的照片没加载：先补一页（loadPrev 内部会把光标按插入张数
+				// 往下挪保持同一张，再由 pendingCursorUp 上移一行落进新照片）
+				pendingCursorUp = true
+				loadPrev()
+			} else {
+				// 已经到全库最前（没有更新的了）：焦点交给导航栏，不再「按了没反应」
+				navIndex.value = 1
+			}
+		} else if (code == KEY_LEFT) {
+			if (cursorIdx.value > 0) {
+				cursorIdx.value = cursorIdx.value - 1
+				moveCursorIntoView()
+			}
+		} else if (code == KEY_RIGHT) {
+			const t = rightTarget(cursorIdx.value)
+			if (t >= 0) {
+				// 行内右移（残行会顺延到下一张）
+				cursorIdx.value = t
+				moveCursorIntoView()
+			} else {
+				// 排满的一行走到行末：进时间轴
+				railFocus.value = true
+				railIndex.value = activeIndex.value
+				scrollRailTo(railIndex.value)
+			}
+		} else if (code == KEY_OK || code == KEY_ENTER) {
+			// 打开**光标那一张**（用户看到的框 = 实际打开的图）
+			openViewer(cursorIdx.value)
+		} else if (code == KEY_BACK) {
+			// 先把焦点交给导航栏（用户口径），导航栏里再按返回才回首页
+			navIndex.value = 1
+		} else {
+			return false
+		}
+		return true
+	}
+
+	/** 层名 → 处理函数（UTS 不能把函数放进容器，所以用名字查表） */
+	function runKeyLayer(layer: string, code: number): boolean {
+		if (layer == 'library.nav') {
+			return onNavKey(code)
+		}
+		if (layer == 'library.layout') {
+			return onLayoutKey(code)
+		}
+		if (layer == 'library.rail') {
+			return onRailKey(code)
+		}
+		if (layer == 'library.grid') {
+			return onGridKey(code)
+		}
+		return false
+	}
+
+	/**
+	 * 遥控器入口（T5 分发层）：网格在最底，时间轴和布局切换条按当前焦点压在上面，
+	 * 栈顶优先消费；日志见 `common/keys.uts` 的 `[keys] key=... → ...`。
+	 */
+	function handleKey(code: number) {
+		const stack: Array<string> = []
+		stack.push('library.grid')
+		if (railFocus.value) {
+			stack.push('library.rail')
+		}
+		if (layoutFocus.value) {
+			stack.push('library.layout')
+		}
+		if (navIndex.value >= 0) {
+			// 导航栏焦点永远是栈顶：进导航栏后方向键不再动网格
+			stack.push('library.nav')
+		}
+		dispatchKey(code, stack, (layer: string, c: number): boolean => {
+			return runKeyLayer(layer, c)
+		})
+	}
+
+	/**
+	 * 订阅遥控器按键。
+	 *
+	 * onLoad 和 onShow 各调一次：reLaunch 时新旧页面的 onLoad / onUnload 顺序不保证，
+	 * 加上运行时有可能替换 window.callback，所以每次显示都重新确认一遍通道；
+	 * startTvKeyHook 内部按 id 归属 + 检测重复包装，重复调用是安全的。
+	 */
+	function armKeyHook() {
+		keyHook = startTvKeyHook((code: number) => {
+			handleKey(code)
+		})
+	}
+
+	/**
+	 * 组件关闭后：作废在途的跨页补数据循环，并把按键通道收回来
+	 * （组件卸载时的 stop 因 id 不匹配会被忽略，见 AGENTS 5.12）。
+	 * 必须定义在 `armKeyHook` 与 `handleKey` 之后：UTS 不支持函数提升（AGENTS 5.2）。
+	 */
+	function onViewerClose() {
+		viewerOpen.value = false
+		viewerSession = viewerSession + 1
+		viewerMoving = false
+		viewerTarget = viewerOffset
+		// 光标落在**刚才看的那张**上（用户口径）：不再按视口顶部反推。
+		// viewerOffset 是全局下标，换成窗口下标后把页面滚到它可见为止。
+		const idx = viewerOffset - startOffset
+		if (idx >= 0 && idx < photos.value.length) {
+			cursorIdx.value = idx
+			moveCursorIntoView()
+		}
+		armKeyHook()
+	}
+
+	onLoad(() => {
+		const info = uni.getWindowInfo()
+		unit = info.windowWidth / 750.0
+		cellPx = (cellSizeRpx(cols.value) + CELL_MARGIN_RPX) * unit
+		dayHeaderPx = 34.0 * unit
+		monthHeaderPx = 30.0 * unit
+		groupGapPx = 8.0 * unit
+		railItemPx = 15.0 * unit
+		prevGapPx = 24.0 * unit
+		// 导航栏 60 + 间距 8 + 工具条 22 + 间距 8 + 页面上下内边距 12 + 网格底部内边距 8 ≈ 118rpx
+		viewportPx = info.windowHeight - 118.0 * unit
+		armKeyHook()
+		init()
+	})
+
+	onShow(() => {
+		// 从搜索 / 设置 / 相册回来：焦点默认回到网格（导航栏只在用户主动按上/返回时拿焦点）
+		navIndex.value = -1
+		armKeyHook()
+	})
+
+	onUnload(() => {
+		stopTvKeyHook(keyHook)
+	})
+</script>
+
+<style>
+	/* 参考 tvOS：深灰而非纯黑，卡片再亮一档形成层次。
+	   四边只留 6rpx，内容尽量贴近屏幕边缘；rpx 随屏宽缩放，各尺寸一致贴合 */
+	.page {
+		flex: 1;
+		position: relative;
+		background-color: #141418;
+		padding: 6rpx;
+	}
+
+	/* ---------------- 导航栏 ---------------- */
+
+	/* 导航栏已抽到 components/NavBar.uvue（悬浮、不占布局高度），
+	   这里只留一个等高占位：60rpx + 8rpx 间距，与原来的 navbar 占位一致，
+	   所以 onLoad 里 viewportPx 的 118rpx 估算不用改 */
+	.nav-spacer {
+		height: 60rpx;
+		margin-bottom: 8rpx;
+	}
+
+	/* 工具条：高度 22rpx（同样计入 viewportPx 估算） */
+	.topbar {
+		height: 22rpx;
+		flex-direction: row;
+		align-items: center;
+		justify-content: space-between;
+		margin-bottom: 8rpx;
+	}
+
+	.tb-left {
+		flex-direction: row;
+		align-items: center;
+	}
+
+	.tb-sub {
+		font-size: 12rpx;
+		color: #7C7D7F;
+	}
+
+	.tb-right {
+		flex-direction: row;
+		align-items: center;
+	}
+
+	.tb-hint {
+		font-size: 11rpx;
+		color: #5A5B5C;
+	}
+
+	.tb-error {
+		font-size: 11rpx;
+		color: #E26052;
+		margin-left: 8rpx;
+	}
+
+	/* 每行张数切换 */
+	.col-switch {
+		flex-direction: row;
+		align-items: center;
+		margin-left: 16rpx;
+	}
+
+	.col-switch-label {
+		font-size: 10rpx;
+		color: #5A5B5C;
+		margin-right: 4rpx;
+	}
+
+	.col-switch-unit {
+		font-size: 10rpx;
+		color: #5A5B5C;
+		margin-left: 4rpx;
+	}
+
+	.col-btn {
+		width: 20rpx;
+		height: 20rpx;
+		align-items: center;
+		justify-content: center;
+		border-radius: 5rpx;
+		margin-left: 4rpx;
+		background-color: #2E2E34;
+	}
+
+	.col-btn-on {
+		background-color: #3388FF;
+	}
+
+	/* 遥控器焦点：绿色描边 */
+	.col-btn-focus {
+		border-width: 2rpx;
+		border-style: solid;
+		border-color: #3388FF;
+	}
+
+	.col-btn-text {
+		font-size: 10rpx;
+		color: #9F9FA1;
+	}
+
+	.col-btn-text-on {
+		color: #FFFFFF;
+		font-weight: bold;
+	}
+
+	.col-btn-text-focus {
+		color: #3388FF;
+		font-weight: bold;
+	}
+
+	/* ---------------- 主体 ---------------- */
+
+	.body {
+		flex: 1;
+		flex-direction: row;
+	}
+
+	.grid {
+		flex: 1;
+		padding-bottom: 8rpx;
+	}
+
+	/* 顶部留白：给「向上加载更晚照片」留出可滚动余量。
+	   到达全库最前面（atNewest）时不渲染，避免顶上留一条滚不动的空白带，
+	   所以像素映射一律用 gapPx() 而不是常量 prevGapPx */
+	.prev-gap {
+		height: 24rpx;
+		flex-shrink: 0;
+	}
+
+	.group {
+		flex-direction: column;
+		margin-bottom: 8rpx;
+	}
+
+
+	.month-row {
+		height: 30rpx;
+		justify-content: flex-start;
+	}
+
+	.month-text {
+		font-size: 18rpx;
+		font-weight: bold;
+		color: #FFFFFF;
+	}
+
+	.day-row {
+		height: 34rpx;
+		justify-content: flex-start;
+	}
+
+	.day-text {
+		font-size: 13rpx;
+		color: #9F9FA1;
+	}
+
+	.cells {
+		flex-direction: row;
+		flex-wrap: wrap;
+	}
+
+	/* 正方形格子；宽高由 cellStyle 按当前列数动态给出，这里只管外观。
+	   恒留 4rpx 透明边框 + border-box：选中/未选中只改颜色，格子尺寸不变（否则整行会被挤动） */
+	.cell {
+		position: relative;
+		margin: 2rpx;
+		border-radius: 8rpx;
+		background-color: #232328;
+		border-width: 4rpx;
+		border-style: solid;
+		border-color: rgba(0, 0, 0, 0);
+		box-sizing: border-box;
+		/* 兜底：图片再怎么溢出也不跑出圆角 */
+		overflow: hidden;
+	}
+
+	/* 当前选中（= OK 会打开的那张）：亮蓝边框 + 极淡蓝底，与时间轴高亮同色 */
+	.cell-focus {
+		border-color: #3388FF;
+		background-color: rgba(51, 136, 255, 0.18);
+	}
+
+	/* 焦点不在网格（在时间轴 / 布局条 / 导航栏）：只留一圈暗框，表示「这就是当前这张」 */
+	.cell-focus-idle {
+		border-color: #4A4C56;
+	}
+
+	/* 视频 / 实况角标：左下角深色半透明胶囊，压在缩略图上。
+	   尺寸用固定 rpx（8 列时格子约 79rpx，13rpx 高仍在格内），
+	   颜色只用现有调色板，没有再引入强调色 */
+	.cell-tag {
+		position: absolute;
+		left: 4rpx;
+		bottom: 4rpx;
+		height: 13rpx;
+		flex-direction: row;
+		align-items: center;
+		padding-left: 3rpx;
+		padding-right: 4rpx;
+		border-radius: 4rpx;
+		background-color: rgba(0, 0, 0, 0.55);
+	}
+
+	.cell-tag-icon {
+		font-size: 7rpx;
+		color: #FFFFFF;
+		margin-right: 2rpx;
+	}
+
+	.cell-tag-text {
+		font-size: 8rpx;
+		color: #FFFFFF;
+	}
+
+	/* 实况照片的同心圆图标（纯 view 拼，不用图片 / emoji） */
+	.live-ring {
+		width: 8rpx;
+		height: 8rpx;
+		border-radius: 4rpx;
+		border-width: 1rpx;
+		border-style: solid;
+		border-color: #FFFFFF;
+		align-items: center;
+		justify-content: center;
+		margin-right: 2rpx;
+	}
+
+	.live-core {
+		width: 3rpx;
+		height: 3rpx;
+		border-radius: 2rpx;
+		background-color: #FFFFFF;
+	}
+
+	/* ---------------- 右侧时间轴 ---------------- */
+
+	/* 时间轴：年 / 月 全部平铺，超出高度由 scroll-view 承担。
+	   宽度 70rpx 与页面常量 GRID_WIDTH_RPX 对应；行内固定 66rpx
+	   （标签 50 + 间距 2 + 节点列 14），左右都收到最紧，
+	   连线离屏幕右边缘只有 6+4+7≈17rpx */
+	.rail {
+		width: 70rpx;
+		height: 100%;
+		flex-shrink: 0;
+	}
+
+	/* 恒留 2rpx 边框（平时透明）：焦点只改颜色不改宽度，
+	   否则焦点行会把后面所有行往下推 4rpx，scrollRailTo 的落点全偏 */
+	.rail-item {
+		width: 66rpx;
+		height: 15rpx;
+		flex-shrink: 0;
+		flex-direction: row;
+		align-items: center;
+		border-radius: 6rpx;
+		border-width: 2rpx;
+		border-style: solid;
+		border-color: rgba(0, 0, 0, 0);
+		box-sizing: border-box;
+	}
+
+	/* 年份行做分组标题：比月份行高，上下自然留白 */
+	.rail-item-year {
+		height: 18rpx;
+	}
+
+	/* 标签占满左侧固定宽度、靠右对齐，让文字紧贴右侧的连线 */
+	.rail-label {
+		width: 50rpx;
+		font-size: 8rpx;
+		color: #7F858F;
+		text-align: right;
+	}
+
+	/* 年份：白色加粗，字号明显大于月份 */
+	.rail-label-year {
+		font-size: 9rpx;
+		font-weight: bold;
+		color: #E9EBEE;
+	}
+
+	.rail-label-month {
+		font-size: 8rpx;
+		color: #7F858F;
+	}
+
+	/* 节点列：细线贯穿整行，圆点绝对定位叠在线上（不打断连接线） */
+	.rail-node {
+		width: 14rpx;
+		height: 100%;
+		position: relative;
+		align-items: center;
+		margin-left: 2rpx;
+	}
+
+	.rail-line {
+		width: 1rpx;
+		height: 100%;
+		background-color: #2E323A;
+	}
+
+	.rail-dot {
+		position: absolute;
+		left: 4rpx;
+		top: 5rpx;
+		width: 6rpx;
+		height: 6rpx;
+		border-radius: 3rpx;
+		background-color: #5C626B;
+	}
+
+	/* 年份行的星：叠在贯穿线上，占满节点列并居中 */
+	.rail-star {
+		position: absolute;
+		left: 0;
+		top: 0;
+		width: 14rpx;
+		height: 100%;
+		align-items: center;
+		justify-content: center;
+	}
+
+	.rail-star-text {
+		font-size: 8rpx;
+		color: #E9EBEE;
+	}
+
+	.rail-star-on {
+		color: #4C97FF;
+	}
+
+	/* 当前所在的年 / 月：蓝色文字 */
+	.rail-label-on {
+		color: #4C97FF;
+	}
+
+	/* 遥控器焦点：蓝底胶囊 + 蓝描边（只有描边时 TV 上看不出来） */
+	.rail-item-selected {
+		border-color: #5B9CFF;
+		background-color: rgba(51, 136, 255, 0.34);
+	}
+
+	/* 焦点行的文字反白（必须写在 .rail-label-on 之后，否则会被它盖掉） */
+	.rail-label-focus {
+		color: #FFFFFF;
+		font-weight: bold;
+	}
+
+	/* ---------------- 状态 ---------------- */
+
+	.loading {
+		height: 26rpx;
+		align-items: center;
+		justify-content: center;
+	}
+
+	.loading-text {
+		font-size: 11rpx;
+		color: #5A5B5C;
+	}
+
+	.empty {
+		height: 200rpx;
+		align-items: center;
+		justify-content: center;
+	}
+
+	.empty-text {
+		font-size: 12rpx;
+		color: #5A5B5C;
+	}
+
+</style>

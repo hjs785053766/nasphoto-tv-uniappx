@@ -1,0 +1,220 @@
+/**
+ * 遥控器按键分发层（T5）。
+ *
+ * 背景：以前每个页面各自写一份 `handleKey(code)`，里面全是
+ * `if (code == 19) ... else if (code == 20)`，页面里还有「谁先判断谁后判断」的隐式层级
+ * （例如图库页先判布局切换条、再判时间轴、最后才是网格）。
+ * 现在统一成：
+ *
+ *   页面只声明「当前生效的层」（按 底 → 顶 排成栈）+ 一个「层名 → 处理函数」的查表，
+ *   由 `dispatchKey` 从栈顶往下问，**谁先返回 true 谁消费这次按键**，
+ *   没人消费就记一行 `→ none`。
+ *
+ * 约定：
+ *   - 覆盖层（弹窗 / 时间轴 / 导航栏焦点）一律 `return true` 吞掉所有键，
+ *     否则会穿透到下面的网格，出现「焦点在时间轴上却把网格滚走了」；
+ *   - 基础层（网格 / 照片查看器）只对自己认识的键 `return true`，其余 `return false`，
+ *     这样上层让位的键还能落到基础层（例如视频层不认识「下键」，交给查看器开详情）；
+ *   - 返回键永远由**最上层**决定怎么关：能关覆盖层就关覆盖层，关不掉再往下传。
+ *
+ * 注意：这一层只负责「收到按键之后怎么分发」，
+ * 收键通道仍是 `FnOsTvKeys`（包装器常驻、`stopTvKeyHook(id)` 必须带 id），见 AGENTS 5.12。
+ */
+
+/** 方向键 / OK / 返回的 Android KeyEvent.keyCode（全工程唯一定义处） */
+export const KEY_UP = 19
+export const KEY_DOWN = 20
+export const KEY_LEFT = 21
+export const KEY_RIGHT = 22
+export const KEY_OK = 23
+export const KEY_ENTER = 66
+export const KEY_BACK = 4
+/** 菜单键（遥控器「菜单 / ≡」）：目前只用于在查看器里开关详情面板 */
+export const KEY_MENU = 82
+
+/** 连按 / 长按去抖窗口（毫秒）：快进快退、滚动蓄力统一用这个值 */
+export const KEY_REPEAT_MS = 180
+
+/**
+ * 按键日志开关。
+ *
+ * 真机上每次按键都 `console.log` 是**有成本**的（logcat 是同步写），
+ * 长按连发时会把页面拖卡（2026-11-21 用户反馈「长按后整机很卡」）。
+ *
+ * 只在排查「按键被谁吃掉」时临时改 `true`（web 上成本为零），验完改回 `false`。
+ */
+const KEY_DEBUG = false
+
+/** 按键码 → 可读名字（只用于日志） */
+export function keyName(code: number): string {
+	if (code == KEY_UP) {
+		return 'UP'
+	}
+	if (code == KEY_DOWN) {
+		return 'DOWN'
+	}
+	if (code == KEY_LEFT) {
+		return 'LEFT'
+	}
+	if (code == KEY_RIGHT) {
+		return 'RIGHT'
+	}
+	if (code == KEY_OK) {
+		return 'OK'
+	}
+	if (code == KEY_ENTER) {
+		return 'ENTER'
+	}
+	if (code == KEY_BACK) {
+		return 'BACK'
+	}
+	if (code == KEY_MENU) {
+		return 'MENU'
+	}
+	return 'CODE' + code.toString()
+}
+
+function stackText(stack: Array<string>): string {
+	let s = ''
+	for (let i = 0; i < stack.length; i++) {
+		if (i > 0) {
+			s = s + '>'
+		}
+		s = s + stack[i]
+	}
+	return s
+}
+
+// ---------------- 按键轨迹（屏上诊断用） ----------------
+
+/** 一条按键记录（设置页「按键诊断」直接显示这些字段） */
+export type KeyTrace = {
+	/** Date.now()，页面自己格式化成 mm:ss */
+	at: number
+	/** 层名前缀：library / home / album / search / settings / viewer / login / detail */
+	page: string
+	/** `RIGHT(22)` */
+	key: string
+	/** 命中的层名；空串 = 没有任何层认领（`→ none`） */
+	hit: string
+	/** 完整栈，`library.grid>library.rail` */
+	stack: string
+}
+
+const TRACE_MAX = 40
+let traces: Array<KeyTrace> = []
+
+/** 取层名里的页面前缀：`library.rail` → `library` */
+function pageOf(layer: string): string {
+	const i = layer.indexOf('.')
+	return i > 0 ? layer.substring(0, i) : layer
+}
+
+/**
+ * 记一条按键轨迹。
+ *
+ * 为什么需要它：**电视上只能装正式包、看不到 logcat**，出问题时用户没法贴日志。
+ * 这里只保留最近 40 条、每条一次字符串拼接（按键 < 10 次/秒，成本可忽略），
+ * 由设置页「按键诊断」渲染到屏幕上，用遥控器就能读出来。
+ */
+function pushTrace(code: number, hit: string, stack: Array<string>): void {
+	const base = stack.length > 0 ? stack[0] : ''
+	const page = hit.length > 0 ? pageOf(hit) : (base.length > 0 ? pageOf(base) : '?')
+	traces.push({
+		at: Date.now(),
+		page: page,
+		key: keyName(code) + '(' + code.toString() + ')',
+		hit: hit,
+		stack: stackText(stack)
+	} as KeyTrace)
+	if (traces.length > TRACE_MAX) {
+		// UTS 的数组不保证有 shift()，手工重建（一次按键最多搬 40 个引用）
+		const kept: Array<KeyTrace> = []
+		for (let i = traces.length - TRACE_MAX; i < traces.length; i++) {
+			kept.push(traces[i])
+		}
+		traces = kept
+	}
+}
+
+/** 最近按键轨迹，**最新在前**（诊断页从上往下就是「从新到旧」） */
+export function keyTraces(): Array<KeyTrace> {
+	const out: Array<KeyTrace> = []
+	for (let i = traces.length - 1; i >= 0; i--) {
+		out.push(traces[i])
+	}
+	return out
+}
+
+/** 清空轨迹（诊断页的「清空」用） */
+export function clearKeyTraces(): void {
+	const empty: Array<KeyTrace> = []
+	traces = empty
+}
+
+/**
+ * 按栈分发一次按键。
+ *
+ * @param code  Android KeyEvent.keyCode
+ * @param stack 生效的层，**底层在前、顶层在后**（例如 `['library.grid', 'library.rail']`）
+ * @param run   把层名映射到该层真正的处理函数
+ * @returns 消费这次按键的层名；没人消费返回空串
+ *
+ * 每次按键都会往「按键轨迹」里压一条（设置页可看），
+ * 需要控制台日志时把 `KEY_DEBUG` 改 true。
+ */
+export function dispatchKey(code: number, stack: Array<string>, run: (layer: string, code: number) => boolean): string {
+	let hit = ''
+	for (let i = stack.length - 1; i >= 0; i--) {
+		const name = stack[i]
+		if (run(name, code)) {
+			hit = name
+			break
+		}
+	}
+	pushTrace(code, hit, stack)
+	if (KEY_DEBUG) {
+		if (hit.length > 0) {
+			console.log('[keys] key=' + code.toString() + ' ' + keyName(code) + ' → ' + hit + ' (stack=' + stackText(stack) + ')')
+		} else {
+			console.log('[keys] key=' + code.toString() + ' ' + keyName(code) + ' → none (stack=' + stackText(stack) + ')')
+		}
+	}
+	return hit
+}
+
+/**
+ * 连按去抖工具（长按 / 连按只执行最后一次）。
+ *
+ * 典型用法：视频左右键快进——每按一次只更新目标位置并提示，
+ * `schedule` 覆盖上一个未触发的定时器，最后才真正 `seek` 一次，
+ * 避免连按 10 次发 10 个 seek 把播放器拖死。
+ *
+ * 页面/组件各自 `new KeyDebounce(KEY_REPEAT_MS)` 持有实例，
+ * 切图、关闭、卸载时必须 `cancel()`，否则会残留定时器（T5 测试项 3）。
+ */
+export class KeyDebounce {
+	timer: number = 0
+	gapMs: number = KEY_REPEAT_MS
+
+	constructor(gapMs: number) {
+		this.gapMs = gapMs
+	}
+
+	/** 取消上一次未触发的任务，再排一次；只有最后一次会真正执行 */
+	schedule(task: () => void): void {
+		this.cancel()
+		// lambda 里不碰 this（Kotlin 侧少一层捕获），id 直接存回字段
+		this.timer = setTimeout(() => {
+			task()
+		}, this.gapMs)
+	}
+
+	/** 取消未触发的任务（触发过的 id 再清一次也无副作用） */
+	cancel(): void {
+		if (this.timer != 0) {
+			clearTimeout(this.timer)
+			this.timer = 0
+		}
+	}
+}

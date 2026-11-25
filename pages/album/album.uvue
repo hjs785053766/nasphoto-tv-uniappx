@@ -1,0 +1,674 @@
+﻿<template>
+	<view class="page">
+		<!-- 全局导航栏（与首页 / 图库共用 components/NavBar.uvue），分区切到「相册」
+		     遥控器上键到顶 / 返回键会先把焦点交到这里（见 5.25） -->
+		<NavBar
+			:active="2"
+			:focus-index="navIndex"
+			:show-search="true"
+			:show-settings="true"
+			:show-clock="true"
+			:settings-active="false"
+			:search-active="false"
+			@nav="onNavClick"
+			@search="onOpenSearch"
+			@settings="onOpenSettings"
+		/>
+		<!-- 导航栏不占布局高度，用等高空白撑出原有间距（viewportPx 估算不受影响） -->
+		<view class="nav-spacer"></view>
+
+		<!-- 工具条：相册数 / 错误提示。排序由接口固定（按名称倒序），右侧不放假控件 -->
+		<view class="topbar">
+			<text class="tb-sub">{{ totalText }}</text>
+			<text class="tb-error" v-if="errorText.length > 0">{{ errorText }}</text>
+		</view>
+
+		<!-- 相册网格：封面正方形 + 名称 + 数量 / 共享标记 -->
+		<scroll-view
+			class="body"
+			direction="vertical"
+			:scroll-top="scrollTop"
+			:show-scrollbar="false"
+			@scroll="onScroll"
+		>
+			<!-- 相册网格：封面正方形 + 名称 + 数量 / 共享标记；
+			     宝宝相册（category=1）只是排在最前，排布和普通相册一致 -->
+			<view class="grid">
+				<view
+					class="card"
+					:class="cardClass(i)"
+					:style="cardStyle"
+					v-for="(a, i) in items"
+					:key="a.name + '-' + i"
+					@click="onCardClick(i)"
+				>
+					<view class="cover" :style="coverStyle">
+						<ThumbImage :path="a.cover" />
+						<!-- 左下角角标，和图库的类型角标同一套做法 -->
+						<view class="baby-badge" v-if="a.category == 1">
+							<text class="baby-badge-text">宝宝相册</text>
+						</view>
+					</view>
+					<view class="card-text">
+						<text class="card-name">{{ a.name }}</text>
+						<view class="card-meta">
+							<text class="card-count">{{ countText(a) }}</text>
+							<text class="card-shared" v-if="a.shared">已共享</text>
+						</view>
+					</view>
+				</view>
+			</view>
+
+			<view class="loading" v-if="loading">
+				<text class="loading-text">正在加载…</text>
+			</view>
+			<view class="empty" v-if="!loading && items.length == 0">
+				<text class="empty-text">{{ errorText.length > 0 ? errorText : '这里还没有相册' }}</text>
+			</view>
+		</scroll-view>
+	</view>
+</template>
+
+<script setup lang="uts">
+	import { albums, logout, startTvKeyHook, stopTvKeyHook } from '@/uni_modules/fnos-auth'
+	import { KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_OK, KEY_ENTER, KEY_BACK, dispatchKey } from '@/common/keys.uts'
+	import ThumbImage from '../library/ThumbImage.uvue'
+	import NavBar from '@/components/NavBar.uvue'
+
+
+
+	/** 相册一次拉全量（本机一百多个），数据量小，不做分页 */
+	const PAGE_LIMIT = 1000
+	/** 网格可用宽度（rpx）= 750 − 页面左右边距 12 */
+	const GRID_WIDTH_RPX = 738.0
+	/** 卡片四周外边距之和（3rpx × 2），相邻卡片间距即 6rpx */
+	const CARD_GAP_RPX = 6.0
+	/** 卡片文字区高度（rpx）：名称 18 + 元信息 14 + 上下留白 8 */
+	const CARD_TEXT_RPX = 40.0
+
+	type AlbumItem = {
+		id: number
+		name: string
+		count: number
+		shared: boolean
+		cover: string
+		/** 1 = 宝宝相册，其余为普通相册 */
+		category: number
+		month: string
+		start: string
+	}
+
+	/** 网格顺序（宝宝相册强制排第一，其余保持接口顺序），遥控器焦点索引基于它 */
+	const items = ref<Array<AlbumItem>>([])
+	const loading = ref(false)
+	const errorText = ref('')
+	const cols = ref(6)
+	const scrollTop = ref(0)
+	/**
+	 * 焦点框是否显示。
+	 *
+	 * 电视端**必须一进来就显示**（遥控器是唯一输入，没有鼠标可以「点一下让光标出现」）；
+	 * 以前默认 false、只在点击卡片时置 true，真机表现就是「按方向键看不到光标」。
+	 */
+	const focusVisible = ref(true)
+
+	/** 本次页面的按键订阅 id（退订时原样传回） */
+	let keyHook = 0
+	/** 1rpx 对应的逻辑像素 */
+	let unit = 1.0
+	/** 网格可视高度（px），遥控器滚动跟随用 */
+	let viewportPx = 0.0
+	/** 一行卡片占位高度（px，含外边距） */
+	let cellPx = 0.0
+	/**
+	 * 遥控器焦点下标。
+	 *
+	 * **必须是 ref**：以前写成普通 `let`，模板里的 `cardClass(i)` 读得到新值但不会重渲染，
+	 * 于是焦点框只有「按上下键顺带改了 scrollTop」时才刷新 —— 真机现象就是
+	 * 「光标只能上下动、左右移动后上下错乱」（左右不动 scrollTop，界面停在旧焦点上）。
+	 */
+	const focusIndex = ref(0)
+
+	/**
+	 * 导航栏遥控器焦点（-1 = 焦点在网格里）。
+	 * 上键到顶 / 返回键把焦点交给导航栏，导航栏里再按返回才回首页（用户口径 2026-11-22）。
+	 */
+	const navIndex = ref(-1)
+	/** 导航栏可聚焦入口个数：0 首页 / 1 图库 / 2 相册 / 3 搜索 / 4 设置 */
+	const NAV_COUNT = 5
+	/** 当前实际滚动位置（px），scrollTop 是绑定值不能当读数用 */
+	let currentScroll = 0.0
+	/** 是否已经在跳回登录页（避免重复 reLaunch） */
+	let redirecting = false
+	/** 上次「鉴权失败」的时间戳：用于区分冷启动假 401 与真的登录态失效 */
+	let authFailAt = 0
+
+	/** 单张卡片宽度（rpx）：cols * (w + 6) = 738 */
+	function cardSizeRpx(): number {
+		return Math.floor(GRID_WIDTH_RPX / cols.value - CARD_GAP_RPX)
+	}
+
+	/** 卡片宽高 + 外边距：uvue 没有 grid，靠 flex-wrap + 内联尺寸排版 */
+	const cardStyle = computed((): string => {
+		const w = cardSizeRpx()
+		const h = w + CARD_TEXT_RPX + CARD_GAP_RPX
+		const m = CARD_GAP_RPX / 2.0
+		return 'width: ' + w.toString() + 'rpx; height: ' + h.toString() + 'rpx; margin: ' +
+			m.toString() + 'rpx;'
+	})
+
+	/** 封面强制正方形（宽 100%，高与卡片同宽） */
+	const coverStyle = computed((): string => {
+		return 'height: ' + cardSizeRpx().toString() + 'rpx;'
+	})
+
+	const totalText = computed((): string => {
+		if (loading.value && items.value.length == 0) {
+			return '正在读取相册…'
+		}
+		return '共 ' + items.value.length.toString() + ' 个相册'
+	})
+
+	function countText(a: AlbumItem): string {
+		return a.count.toString() + '项'
+	}
+
+	/** 焦点框：焦点在网格时亮蓝；焦点交给导航栏时变灰（表示「当前相册」但不在操作它） */
+	function cardClass(i: number): string {
+		if (!focusVisible.value || i != focusIndex.value) {
+			return 'card'
+		}
+		return navIndex.value >= 0 ? 'card card-focus card-focus-idle' : 'card card-focus'
+	}
+
+	/** 按分区标签：0 = 首页（reLaunch 回大屏），1 = 图库（切过去），2 = 相册（本页，忽略） */
+	function onNavClick(i: number) {
+		if (i == 0) {
+			stopTvKeyHook(keyHook)
+			uni.reLaunch({ url: '/pages/home/home' })
+		} else if (i == 1) {
+			stopTvKeyHook(keyHook)
+			uni.redirectTo({ url: '/pages/library/library' })
+		}
+	}
+
+	/** 导航栏「搜索」：进搜索页（navigateTo，返回键 / × 回相册） */
+	function onOpenSearch() {
+		stopTvKeyHook(keyHook)
+		uni.navigateTo({ url: '/pages/search/search' })
+	}
+
+	/** 导航栏「设置」：进设置页（navigateTo，返回键回相册；退出登录在设置页里） */
+	function onOpenSettings() {
+		stopTvKeyHook(keyHook)
+		uni.navigateTo({ url: '/pages/settings/settings' })
+	}
+
+	/** 跳到导航栏第 i 个入口（0 首页 / 1 图库 / 2 相册 / 3 搜索 / 4 设置） */
+	function gotoNav(i: number) {
+		navIndex.value = -1
+		if (i == 3) {
+			onOpenSearch()
+		} else if (i == 4) {
+			onOpenSettings()
+		} else if (i == 0 || i == 1) {
+			onNavClick(i)
+		}
+		// i == 2 是当前页（相册），不重复跳
+	}
+
+	/** 层「album.nav」：导航栏焦点（栈顶覆盖层）。返回键在这里 = 离开本页 */
+	function onNavKey(code: number): boolean {
+		if (code == KEY_LEFT) {
+			navIndex.value = (navIndex.value + NAV_COUNT - 1) % NAV_COUNT
+		} else if (code == KEY_RIGHT) {
+			navIndex.value = (navIndex.value + 1) % NAV_COUNT
+		} else if (code == KEY_OK || code == KEY_ENTER) {
+			gotoNav(navIndex.value)
+		} else if (code == KEY_DOWN) {
+			navIndex.value = -1
+		} else if (code == KEY_BACK) {
+			navIndex.value = -1
+			stopTvKeyHook(keyHook)
+			uni.reLaunch({ url: '/pages/home/home' })
+		}
+		return true
+	}
+
+	/** 鉴权类错误：token 失效 / 未授权，需要重新登录 */
+	function isAuthError(msg: string): boolean {
+		return msg.indexOf('401') >= 0 ||
+			msg.indexOf('5001') >= 0 ||
+			msg.indexOf('未授权') >= 0 ||
+			msg.indexOf('鉴权') >= 0 ||
+			msg.indexOf('token') >= 0 ||
+			msg.indexOf('Token') >= 0
+	}
+
+	/**
+	 * token 过期就回登录页。与图库页一样**不**置 skipAuto：
+	 * 登录页会用保存的凭据自动重登（web 端 dev server 也会先静默续期）。
+	 */
+	function redirectToLogin() {
+		if (redirecting) {
+			return
+		}
+		// 冷启动 / 重新进 App 的第一次请求可能还没带上 token，那一下 401 是假的：
+		// 直接跳登录页会出现「闪一下登录页又回首页」。5 秒内第一次只报错，再来一次才跳。
+		const now = Date.now()
+		if (now - authFailAt > 5000) {
+			authFailAt = now
+			return
+		}
+		redirecting = true
+		stopTvKeyHook(keyHook)
+		logout()
+		uni.reLaunch({ url: '/pages/index/index' })
+	}
+
+	function failWith(msg: string) {
+		errorText.value = msg
+		if (isAuthError(msg)) {
+			redirectToLogin()
+		}
+	}
+
+	async function loadAlbums() {
+		if (loading.value) {
+			return
+		}
+		loading.value = true
+		errorText.value = ''
+		try {
+			const res = await albums(0, PAGE_LIMIT)
+			if (!res.ok) {
+				failWith(res.error.length > 0 ? res.error : '相册列表加载失败')
+				return
+			}
+			// 宝宝相册（category=1）强制排到第一个（接口按名称倒序，中文名本来也常在最前，
+			// 但改过排序或重命名后就不一定了），其余保持接口顺序
+			const babies: Array<AlbumItem> = []
+			const normals: Array<AlbumItem> = []
+			for (let i = 0; i < res.items.length; i++) {
+				const a = res.items[i]
+				const item = {
+					id: a.id,
+					name: a.name,
+					count: a.count,
+					shared: a.shared,
+					cover: a.cover,
+					category: a.category,
+					month: a.month,
+					start: a.start
+				} as AlbumItem
+				if (a.category == 1) {
+					babies.push(item)
+				} else {
+					normals.push(item)
+				}
+			}
+			const all: Array<AlbumItem> = []
+			for (let i = 0; i < babies.length; i++) {
+				all.push(babies[i])
+			}
+			for (let i = 0; i < normals.length; i++) {
+				all.push(normals[i])
+			}
+			items.value = all
+			// 宝宝相册按上面重排后恒在第一格：焦点落回它，且框保持可见
+			focusIndex.value = 0
+			focusVisible.value = true
+			scrollTop.value = 0
+			currentScroll = 0.0
+		} catch (e) {
+			failWith((e as Error).message)
+		} finally {
+			loading.value = false
+		}
+	}
+
+	/** 记录用户/程序实际滚动到的位置（scrollTop 是绑定值，不能当读数用） */
+	function onScroll(e: UniScrollEvent) {
+		currentScroll = e.detail.scrollTop
+	}
+
+	/**
+	 * 定位到指定位置。
+	 * scrollTop 绑定的值没变化时不会触发滚动（例如用户手动滚过之后），
+	 * 所以相同值先挪 1px 再在绘制前回到目标。
+	 */
+	function applyScrollTop(v: number) {
+		const target = v < 0.0 ? 0.0 : v
+		if (target == scrollTop.value) {
+			scrollTop.value = target + 1.0
+			Promise.resolve().then(() => {
+				scrollTop.value = target
+				currentScroll = target
+			})
+		} else {
+			scrollTop.value = target
+			currentScroll = target
+		}
+	}
+
+	/** 把第 i 张卡片所在行滚进视口（遥控器上下移动时用） */
+	function ensureVisible(i: number) {
+		const row = Math.floor(i / cols.value)
+		const top = row * cellPx
+		const bottom = top + cellPx
+		if (top < currentScroll) {
+			applyScrollTop(top)
+		} else if (bottom > currentScroll + viewportPx) {
+			applyScrollTop(bottom - viewportPx)
+		}
+	}
+
+	/**
+	 * 点击 / OK：打开相册内页（navigateTo 保留列表状态，返回时位置不丢）。
+	 *
+	 * 必须定义在 `handleKey` **之前**：UTS 编译成 Kotlin 局部函数，不支持提升
+	 * （否则报「找不到名称 onCardClick」，见 AGENTS 5.2 第一条）。
+	 */
+	function onCardClick(i: number) {
+		focusIndex.value = i
+		focusVisible.value = true
+		navIndex.value = -1
+		if (i < 0 || i >= items.value.length) {
+			return
+		}
+		const a = items.value[i]
+		stopTvKeyHook(keyHook)
+		uni.navigateTo({ url: '/pages/album/detail?id=' + a.id.toString() })
+	}
+
+	/**
+	 * 层「album.grid」：相册封面网格（基础层）。
+	 *
+	 * 四向移动都基于 `cols`（可见列数）算下标：左右 ±1 且不跨行，上下 ±cols；
+	 * 最后一行不满时下键落到该行最后一格，不会「按了没反应」。
+	 * **第一行再按上 → 焦点交给导航栏；返回键也是先交导航栏**（用户口径 2026-11-22）。
+	 */
+	function onGridKey(code: number): boolean {
+		if (code == KEY_BACK) {
+			navIndex.value = 2
+			return true
+		}
+		const n = items.value.length
+		if (n == 0) {
+			if (code == KEY_UP) {
+				navIndex.value = 2
+			}
+			return true
+		}
+		const c = cols.value
+		const cur = focusIndex.value
+		const col = cur % c
+		let next = cur
+		if (code == KEY_LEFT) {
+			if (col > 0) {
+				next = cur - 1
+			}
+		} else if (code == KEY_RIGHT) {
+			if (col < c - 1 && cur + 1 < n) {
+				next = cur + 1
+			}
+		} else if (code == KEY_UP) {
+			if (cur - c >= 0) {
+				next = cur - c
+			} else {
+				// 已经在第一行：焦点交给导航栏
+				navIndex.value = 2
+				return true
+			}
+		} else if (code == KEY_DOWN) {
+			const below = cur + c
+			if (below < n) {
+				next = below
+			} else if (Math.floor(cur / c) < Math.floor((n - 1) / c)) {
+				// 下一行是最后一行且不满：落到全库最后一格（那一行里还有内容）
+				next = n - 1
+			}
+		} else if (code == KEY_OK || code == KEY_ENTER) {
+			onCardClick(cur)
+			return true
+		} else {
+			return false
+		}
+		focusIndex.value = next
+		focusVisible.value = true
+		ensureVisible(next)
+		return true
+	}
+
+	/** 层名 → 处理函数（UTS 不能把函数放进容器，所以用名字查表） */
+	function runKeyLayer(layer: string, code: number): boolean {
+		if (layer == 'album.nav') {
+			return onNavKey(code)
+		}
+		if (layer == 'album.grid') {
+			return onGridKey(code)
+		}
+		return false
+	}
+
+	/** 遥控器入口（T5 分发层）：网格在底，导航栏焦点压在栈顶 */
+	function handleKey(code: number) {
+		const stack: Array<string> = []
+		stack.push('album.grid')
+		if (navIndex.value >= 0) {
+			stack.push('album.nav')
+		}
+		dispatchKey(code, stack, (layer: string, c: number): boolean => {
+			return runKeyLayer(layer, c)
+		})
+	}
+
+	/** onLoad 和 onShow 各订阅一次：页面切换时新旧页 onLoad/onUnload 顺序不保证 */
+	function armKeyHook() {
+		keyHook = startTvKeyHook((code: number) => {
+			handleKey(code)
+		})
+	}
+
+	function colsForWidth(w: number): number {
+		if (w >= 900.0) {
+			return 6
+		}
+		if (w >= 640.0) {
+			return 5
+		}
+		if (w >= 480.0) {
+			return 4
+		}
+		return 3
+	}
+
+	onLoad(() => {
+		const info = uni.getWindowInfo()
+		unit = info.windowWidth / 750.0
+		cols.value = colsForWidth(info.windowWidth)
+		// 一行占位 = 卡片高（宽 + 文字区 + 一个 GAP）+ 上下外边距各 GAP/2（合起来正好再加一个 GAP）
+		cellPx = (cardSizeRpx() + CARD_GAP_RPX * 2.0 + CARD_TEXT_RPX) * unit
+		// 导航栏 60 + 间距 8 + 工具条 22 + 间距 8 + 页面上下内边距 12 + 网格底部 8 ≈ 118rpx
+		viewportPx = info.windowHeight - 118.0 * unit
+		armKeyHook()
+		loadAlbums()
+	})
+
+	onShow(() => {
+		// 从内页 / 搜索 / 设置回来：焦点回到网格
+		navIndex.value = -1
+		armKeyHook()
+	})
+
+	onUnload(() => {
+		stopTvKeyHook(keyHook)
+	})
+</script>
+
+<style>
+	/* 与图库页一致的深灰底，卡片再亮一档形成层次 */
+	.page {
+		flex: 1;
+		position: relative;
+		background-color: #141418;
+		padding: 6rpx;
+	}
+
+	/* ---------------- 导航栏 ---------------- */
+
+	/* 导航栏已抽到 components/NavBar.uvue（悬浮、不占布局高度），
+	   这里只留占位，保持原有间距（viewportPx 的 118rpx 估算不用改） */
+	.nav-spacer {
+		height: 60rpx;
+		margin-bottom: 8rpx;
+	}
+
+	/* ---------------- 工具条 ---------------- */
+
+	.topbar {
+		height: 22rpx;
+		flex-direction: row;
+		align-items: center;
+		margin-bottom: 8rpx;
+		padding-left: 2rpx;
+		padding-right: 2rpx;
+	}
+
+	.tb-sub {
+		font-size: 12rpx;
+		color: #7C7D7F;
+	}
+
+	.tb-error {
+		font-size: 11rpx;
+		color: #FF6B6B;
+		margin-left: 8rpx;
+	}
+
+	/* ---------------- 相册网格 ---------------- */
+
+	.body {
+		flex: 1;
+	}
+
+	/* 不留左右内边距：可用宽度必须正好是 738rpx = 页面内宽，
+	   否则 6 列加起来超宽，最后一张会被挤到下一行 */
+	.grid {
+		flex-direction: row;
+		flex-wrap: wrap;
+	}
+
+	/* 卡片：透明底，只靠封面圆角 + 焦点描边区分。
+	   焦点/非焦点都保留 2rpx 边框（只改颜色），避免边框撑开尺寸导致位移 */
+	.card {
+		flex-direction: column;
+		border-radius: 8rpx;
+		border-width: 2rpx;
+		border-style: solid;
+		border-color: #141418;
+		background-color: #141418;
+		overflow: hidden;
+		box-sizing: border-box;
+	}
+
+	.card-focus {
+		border-color: #3388FF;
+		background-color: #1A2233;
+	}
+
+	/* 焦点不在网格（在导航栏）：只留一圈暗框，表示「这是当前相册」但不在操作它 */
+	.card-focus-idle {
+		border-color: #4A4C56;
+		background-color: #141418;
+	}
+
+	.cover {
+		position: relative;
+		width: 100%;
+		border-radius: 6rpx;
+		overflow: hidden;
+		background-color: #1E1E21;
+	}
+
+	/* 宝宝相册角标：左下角深色半透明胶囊（与图库类型角标同一套尺寸） */
+	.baby-badge {
+		position: absolute;
+		left: 4rpx;
+		bottom: 4rpx;
+		height: 13rpx;
+		flex-direction: row;
+		align-items: center;
+		padding-left: 4rpx;
+		padding-right: 4rpx;
+		border-radius: 4rpx;
+		background-color: rgba(0, 0, 0, 0.55);
+	}
+
+	.baby-badge-text {
+		font-size: 8rpx;
+		color: #FFFFFF;
+	}
+
+	.card-text {
+		flex: 1;
+		flex-direction: column;
+		justify-content: center;
+		padding-left: 2rpx;
+		padding-right: 2rpx;
+	}
+
+	/* 相册名：单行，超长裁切（不同 ROM 对 text-overflow 支持不一，overflow 兜底） */
+	.card-name {
+		height: 18rpx;
+		font-size: 13rpx;
+		color: #FFFFFF;
+		overflow: hidden;
+		white-space: nowrap;
+		text-overflow: ellipsis;
+	}
+
+	.card-meta {
+		height: 14rpx;
+		flex-direction: row;
+		align-items: center;
+		justify-content: space-between;
+		margin-top: 4rpx;
+	}
+
+	.card-count {
+		font-size: 11rpx;
+		color: #8A8B8E;
+	}
+
+	.card-shared {
+		font-size: 11rpx;
+		color: #7C7D7F;
+	}
+
+	/* ---------------- 状态 ---------------- */
+
+	.loading {
+		height: 40rpx;
+		flex-direction: row;
+		align-items: center;
+		justify-content: center;
+	}
+
+	.loading-text {
+		font-size: 12rpx;
+		color: #6E6F72;
+	}
+
+	.empty {
+		height: 120rpx;
+		flex-direction: row;
+		align-items: center;
+		justify-content: center;
+	}
+
+	.empty-text {
+		font-size: 13rpx;
+		color: #6E6F72;
+	}
+</style>

@@ -1,0 +1,15 @@
+{
+  "id": "fnos-auth",
+  "displayName": "fnOS 相册 TV 登录鉴权",
+  "version": "1.0.0",
+  "description": "飞牛 fnOS 相册的 AccessToken 登录封装：访问码网关、自签证书 TOFU、WSS 加密登录、两步验证、authx 签名请求",
+  "keywords": [
+    "fnos",
+    "飞牛",
+    "token",
+    "AccessToken",
+    "login",
+    "TV"
+  ],
+  "uni_modules": {}
+}

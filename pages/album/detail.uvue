@@ -1,0 +1,1292 @@
+<template>
+	<view class="page">
+		<!-- 顶栏：返回 + 相册名，右侧只保留「拍摄时间」排序（其余功能按需求不做） -->
+		<view class="navbar">
+			<view class="nav-left" @click="onBack">
+				<view class="nav-back" :class="backClass()">
+					<text class="nav-back-text">‹</text>
+				</view>
+				<text class="nav-title">{{ titleText }}</text>
+			</view>
+			<view class="nav-right">
+				<!-- 排序：遥控器在网格最上面一行按上 → 焦点到顶栏，左右选「返回 / 排序」，OK 生效 -->
+				<view class="sort-btn" :class="sortClass()" @click="onToggleSort">
+					<text class="sort-label">拍摄时间</text>
+					<text class="sort-arrow">{{ asc ? '↑' : '↓' }}</text>
+				</view>
+			</view>
+		</view>
+
+		<!-- 照片：按「年/月」+「日期 周几」分组，6 列正方形网格。
+		     相册信息放在滚动内容最上方，跟内容一起滚走（不吸顶） -->
+		<scroll-view
+			class="body"
+			direction="vertical"
+			:scroll-top="scrollTop"
+			:show-scrollbar="false"
+			:lower-threshold="800"
+			@scroll="onScroll"
+			@scrolltolower="onLower"
+		>
+			<!-- 内容包一层：浮动光标要用绝对定位跟着内容滚，必须有相对定位的父级 -->
+			<view class="inner">
+			<!-- 相册信息：封面 + 名称 + 照片/视频数量 + 时间范围。
+			     封面用 v-if 等 album/item 回来再挂载 —— ThumbImage 只在 onMounted 加载一次，
+			     先挂空 path 的话封面永远不会出来 -->
+			<view class="head">
+				<view class="head-cover" v-if="cover.length > 0">
+					<ThumbImage :path="cover" />
+				</view>
+				<view class="head-cover" v-else></view>
+				<view class="head-body">
+					<text class="head-name">{{ titleText }}</text>
+					<text class="head-meta">{{ metaText }}</text>
+					<text class="head-range" v-if="rangeText.length > 0">{{ rangeText }}</text>
+				</view>
+			</view>
+
+			<!-- 虚拟列表：上面这段 spacer 撑起「没渲染的那些行 + 日月头」的高度，
+			     总高度恒等于真实内容高度，所以滚动位置和 cellTops 的映射完全不受影响 -->
+			<view class="spacer" :style="spacerTopStyle"></view>
+			<view class="group" v-for="g in sliceGroups" :key="g.key">
+				<view class="month-row" v-if="g.showMonth && g.showHeader">
+					<text class="month-text">{{ g.monthLabel }}</text>
+				</view>
+				<view class="day-row" v-if="g.showHeader">
+					<text class="day-text">{{ g.dayLabel }}</text>
+				</view>
+				<view class="cells">
+					<!-- 光标不在格子上：整页只有一个浮动框（见 cursorBoxStyle），
+					     这样移动光标不会让整张网格重渲染 -->
+					<view class="cell" :style="cellStyle" v-for="c in g.items" :key="c.photo.id" @click="openViewer(c.idx)">
+						<ThumbImage :path="c.photo.thumb" />
+						<!-- 角标文案 / 实况标记在 `groups` 里预先算好（见 Cell 类型）：
+						     模板里直接调 common/photo.uts 的导入函数会报「找不到名称 invoke」 -->
+						<view class="cell-tag" v-if="c.photo.cat == 'video'">
+							<text class="cell-tag-icon">▶</text>
+							<text class="cell-tag-text">{{ c.tag }}</text>
+						</view>
+						<!-- 实况照片：同心圆图标 + 「实况」，与图库网格一致 -->
+						<view class="cell-tag" v-if="c.live">
+							<view class="live-ring">
+								<view class="live-core"></view>
+							</view>
+							<text class="cell-tag-text">实况</text>
+						</view>
+					</view>
+				</view>
+			</view>
+
+			<view class="spacer" :style="spacerBottomStyle"></view>
+			<view class="loading" v-if="loading">
+				<text class="loading-text">正在加载…</text>
+			</view>
+			<view class="loading" v-if="!loading && atEnd && photos.length > 0">
+				<text class="loading-text">已经到底了</text>
+			</view>
+			<view class="empty" v-if="!loading && photos.length == 0">
+				<text class="empty-text">{{ errorText.length > 0 ? errorText : '这个相册还没有照片' }}</text>
+			</view>
+			<!-- 遥控器光标：**唯一**的一个浮动框，位置由 cellTops 算（见 cursorBoxStyle）。
+			     不要改回「给每个格子加 class」——那会让整张网格依赖 cursorIdx，
+			     每按一次方向键就要 diff 上千个格子（真机 Slow UI thread 50 次/30 键）。 -->
+			<view class="cell-cursor" :class="barFocus >= 0 ? 'cell-cursor-idle' : ''" :style="cursorBoxStyle"></view>
+			</view>
+		</scroll-view>
+
+		<!-- 查看器：与图库页共用同一个组件（图片 / 视频 / 实况 / 详情面板都在里面） -->
+		<PhotoViewer
+			v-if="viewerOpen"
+			:photos="photos"
+			:index="viewerIndex"
+			:canPrev="viewerIndex > 0"
+			:canNext="viewerIndex + 1 < photos.length"
+			@close="onViewerClose"
+			@nav="onViewerNav"
+		/>
+	</view>
+</template>
+
+<script setup lang="uts">
+	import { albumDetail, albumPhotos, logout, startTvKeyHook, stopTvKeyHook } from '@/uni_modules/fnos-auth'
+	import { PhotoItem, videoTagText, showLiveTag } from '@/common/photo.uts'
+	import { KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_OK, KEY_ENTER, KEY_BACK, dispatchKey } from '@/common/keys.uts'
+	import ThumbImage from '../library/ThumbImage.uvue'
+	import PhotoViewer from '@/components/PhotoViewer.uvue'
+
+	/** 每页条数 */
+	const PAGE_SIZE = 60
+	/** 网格列数（与相册列表页一致） */
+	const COLS = 6
+	/** 网格可用宽度（rpx）= 750 − 页面左右边距 12 */
+	const GRID_WIDTH_RPX = 738.0
+	/** 单元格四周外边距之和（3rpx × 2） */
+	const CELL_MARGIN_RPX = 6.0
+	/** 分组标题高度（rpx），与样式里的 .month-row / .day-row 一一对应 */
+	const MONTH_ROW_RPX = 30.0
+	const DAY_ROW_RPX = 24.0
+	/** 相册信息条高度（rpx）：.head 76 + 下外边距 8；它现在在滚动内容里，要算进行高 */
+	const HEAD_RPX = 84.0
+	/** 列表底部那块提示（.loading 40rpx，见样式）的高度：算进内容高度，否则「已经到底了」会被裁掉一半 */
+	const TAIL_RPX = 48.0
+
+	type Cell = {
+		idx: number
+		photo: PhotoItem
+		/** 视频角标文案（`videoTagText` 的结果，照片不用时为空串） */
+		tag: string
+		/** 实况角标（`showLiveTag` 的结果） */
+		live: boolean
+	}
+
+	type Group = {
+		key: string
+		monthLabel: string
+		dayLabel: string
+		showMonth: boolean
+		items: Array<Cell>
+		/** 这一组第一张 / 最后一张的全局下标（虚拟列表按它切区间） */
+		firstIdx: number
+		lastIdx: number
+	}
+
+	const photos = ref<Array<PhotoItem>>([])
+	const loading = ref(false)
+	const errorText = ref('')
+	const atEnd = ref(false)
+	const asc = ref(false)
+	const scrollTop = ref(0)
+	/** 相册信息（album/item） */
+	const albumName = ref('')
+	const cover = ref('')
+	const photoCount = ref(0)
+	const videoCount = ref(0)
+	const startText = ref('')
+
+	/** 查看器：具体显示与播放全在 PhotoViewer 组件里，这里只维护「哪一张 / 是否打开」 */
+	const viewerOpen = ref(false)
+	const viewerIndex = ref(0)
+
+	let albumId = 0
+	let offset = 0
+	let keyHook = 0
+	let unit = 1.0
+	let viewportPx = 0.0
+	/** 一行网格的高度（px，含外边距） */
+	let cellPx = 0.0
+	let monthRowPx = 0.0
+	let dayRowPx = 0.0
+	let headPx = 0.0
+	/** 当前实际滚动位置（scrollTop 是绑定值，不能当读数用） */
+	let currentScroll = 0.0
+	/** 每张照片在滚动内容里的顶部偏移（px），OK 键定位视口首张用 */
+	let cellTops: Array<number> = []
+	/** 行表缓存（见 rebuildRows）：与 cellTops 同步重建，按键时只读不算 */
+	let rowTable: Array<number> = []
+	/**
+	 * 遥控器光标：当前选中的照片下标（相册内页以前没有光标，用户反馈「不知道停在哪张」）。
+	 * OK 打开的就是它；上下左右按真实行列移动（见 buildRows）。
+	 */
+	const cursorIdx = ref(0)
+	/** 顶栏遥控器焦点：-1 = 在网格里，0 = 返回按钮，1 = 排序按钮 */
+	const barFocus = ref(-1)
+
+	/**
+	 * 缩略图渲染窗口（按**照片下标**）：只让窗口内的格子下载并持有位图。
+	 *
+	 * 相册内页没有虚拟列表，所有已加载的照片都会建原生 image 视图；真机实测
+	 * 翻 60 行（约 360 张）Native Heap 就从 87MB 涨到 221MB（每张 ~360KB），
+	 * 2400 张要 ~880MB —— 这就是「翻久了越来越卡 / 返回相册封面被回收」的根因。
+	 * 窗口用 computed 直接跟随光标，上下各留若干行（电视上滚动由光标驱动，
+	 * 不会出现「滚过去还没图」）；值没变时 computed 不会触发重渲染。
+	 */
+	/**
+	 * 虚拟列表：当前**真正渲染**的照片区间（全局下标，行对齐，含两端）。
+	 *
+	 * 相册内页以前把「已加载的全部照片」都建成原生视图（2147 张 = 2147 个 image），
+	 * 真机实测内存 221MB、按键滚动 Janky frames 50~74%（p50 22ms，视图树太大）。
+	 * 现在只渲染视口附近 18 行（约 108 张），上下用两个 spacer 撑起总高度，
+	 * 所以 **cellTops / cellPx / 补页 / ensureCursorVisible 的坐标体系完全不变** ——
+	 * spacer 高度按「切片首行行顶」和「切片末行行底」算，总高度恒等于内容高度。
+	 */
+	const sliceStart = ref(0)
+	const sliceEnd = ref(-1)
+	/** 切片上下各留多少行（电视视口约 3 行） */
+	const SLICE_ROWS_ABOVE = 8
+	const SLICE_ROWS_BELOW = 10
+	/** 滞回带：光标离切片边缘还有这么多行时不重切（避免每按一下都重排 DOM） */
+	const SLICE_GUARD_ROWS = 3
+
+	/** 诊断日志开关：排查「按键进了哪一层 / 行表算得对不对」时临时改 true，验完改回 false */
+	const DETAIL_DEBUG = false
+	function detailLog(msg: string) {
+		if (DETAIL_DEBUG) {
+			console.log(msg)
+		}
+	}
+	/** 光标滚动的锁定时间：这段内的 scroll 回调不反推光标 */
+	let cursorLockUntil = 0
+	let redirecting = false
+
+	/** 单格宽度（rpx）：COLS * (w + 6) = 738 */
+	function cellSizeRpx(): number {
+		return Math.floor(GRID_WIDTH_RPX / COLS - CELL_MARGIN_RPX)
+	}
+
+	const cellStyle = computed((): string => {
+		const size = cellSizeRpx()
+		const m = CELL_MARGIN_RPX / 2.0
+		return 'width: ' + size.toString() + 'rpx; height: ' + size.toString() +
+			'rpx; margin: ' + m.toString() + 'rpx;'
+	})
+
+	/**
+	 * 浮动光标的位置（px，相对滚动内容）。
+	 *
+	 * 位置 = 行顶（cellTops[光标]）+ 列偏移；列号从同一行的 top 反查。
+	 * topsVersion 是依赖桩：cellTops 是普通数组（非响应式），重建行高后靠它通知重算。
+	 */
+	const topsVersion = ref(0)
+	const cursorBoxStyle = computed((): string => {
+		if (topsVersion.value < 0) {
+			return 'display:none'
+		}
+		const n = cellTops.length
+		const idx = cursorIdx.value
+		if (n == 0 || idx < 0 || idx >= n) {
+			return 'display:none'
+		}
+		const top = cellTops[idx]
+		let start = idx
+		while (start > 0 && cellTops[start - 1] == top) {
+			start = start - 1
+		}
+		const col = idx - start
+		const m = CELL_MARGIN_RPX / 2.0
+		const size = cellSizeRpx()
+		const left = (m + col * (size + CELL_MARGIN_RPX)) * unit
+		const w = size * unit
+		return 'left: ' + left.toString() + 'px; top: ' + (top + m * unit).toString() +
+			'px; width: ' + w.toString() + 'px; height: ' + w.toString() + 'px;'
+	})
+
+	const titleText = computed((): string => {
+		return albumName.value.length > 0 ? albumName.value : '相册'
+	})
+
+	const metaText = computed((): string => {
+		if (photoCount.value == 0 && videoCount.value == 0) {
+			return ''
+		}
+		let text = photoCount.value.toString() + ' 张照片'
+		if (videoCount.value > 0) {
+			text = text + ' · ' + videoCount.value.toString() + ' 个视频'
+		}
+		return text
+	})
+
+	/** "2025:12:13 05:43:43" → "2025年12月" */
+	function monthText(dt: string): string {
+		if (dt.length < 7) {
+			return ''
+		}
+		const year = dt.substring(0, 4)
+		const month = parseInt(dt.substring(5, 7))
+		if (isNaN(month)) {
+			return ''
+		}
+		return year + '年' + month.toString() + '月'
+	}
+
+	/** 信息区的「2025年12月」：必须放在 monthText 之后（UTS 编译成局部函数，不能依赖提升） */
+	const rangeText = computed((): string => {
+		return monthText(startText.value)
+	})
+
+	/** 0=周日；用算术算，避免依赖 Date 的时区行为 */
+	function weekdayOf(y: number, m: number, d: number): string {
+		const table = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4]
+		const yy = m < 3 ? y - 1 : y
+		const w = (yy + Math.floor(yy / 4) - Math.floor(yy / 100) + Math.floor(yy / 400) + table[m - 1] + d) % 7
+		const names = ['周日', '周一', '周二', '周三', '周四', '周五', '周六']
+		return names[w]
+	}
+
+	/** "2025:12:14 14:09:00" → "2025年12月14日 周日" */
+	function dayText(dt: string): string {
+		if (dt.length < 10) {
+			return dt
+		}
+		const y = parseInt(dt.substring(0, 4))
+		const m = parseInt(dt.substring(5, 7))
+		const d = parseInt(dt.substring(8, 10))
+		if (isNaN(y) || isNaN(m) || isNaN(d)) {
+			return dt
+		}
+		return y.toString() + '年' + m.toString() + '月' + d.toString() + '日 ' + weekdayOf(y, m, d)
+	}
+
+	/** 按「日期」分组，日期变化时插入分组头；月份变化时多插一行月份标题 */
+	const groups = computed((): Array<Group> => {
+		const out: Array<Group> = []
+		const list = photos.value
+		for (let i = 0; i < list.length; i++) {
+			const p = list[i]
+			const dayKey = p.dt.length >= 10 ? p.dt.substring(0, 10) : p.dt
+			const monthKey = p.dt.length >= 7 ? p.dt.substring(0, 7) : p.dt
+			const last: Group | null = out.length > 0 ? out[out.length - 1] : null
+			if (last != null && last.key == dayKey) {
+				last.items.push({ idx: i, photo: p, tag: videoTagText(p), live: showLiveTag(p) } as Cell)
+				last.lastIdx = i
+				continue
+			}
+			const showMonth = last == null || last.key.substring(0, 7) != monthKey
+			out.push({
+				key: dayKey,
+				monthLabel: monthText(p.dt),
+				dayLabel: dayText(p.dt),
+				showMonth: showMonth,
+				items: [{ idx: i, photo: p, tag: videoTagText(p), live: showLiveTag(p) } as Cell],
+				firstIdx: i,
+				lastIdx: i
+			} as Group)
+		}
+		return out
+	})
+
+	/** 切片里的一段（和 Group 同构，多了 showHeader：切片从组中间开始时就不画日月头） */
+	type SliceGroup = {
+		key: string
+		monthLabel: string
+		dayLabel: string
+		showMonth: boolean
+		showHeader: boolean
+		items: Array<Cell>
+	}
+
+	/**
+	 * 切片内容：只取和 [sliceStart, sliceEnd] 有交集的组，并按行边界裁掉多余部分。
+	 * 行边界由调用方保证（ensureSlice 用 rowStartOf / rowEndOf），所以 flex-wrap 不会错位。
+	 */
+	const sliceGroups = computed((): Array<SliceGroup> => {
+		const out: Array<SliceGroup> = []
+		const lo = sliceStart.value
+		const hi = sliceEnd.value
+		if (hi < lo) {
+			return out
+		}
+		const gs = groups.value
+		for (let i = 0; i < gs.length; i++) {
+			const g = gs[i]
+			if (g.lastIdx < lo || g.firstIdx > hi) {
+				continue
+			}
+			const from = g.firstIdx > lo ? g.firstIdx : lo
+			const to = g.lastIdx < hi ? g.lastIdx : hi
+			const off = from - g.firstIdx
+			out.push({
+				key: g.key,
+				monthLabel: g.monthLabel,
+				dayLabel: g.dayLabel,
+				showMonth: g.showMonth,
+				showHeader: from == g.firstIdx,
+				items: g.items.slice(off, off + (to - from + 1))
+			} as SliceGroup)
+		}
+		return out
+	})
+
+	/**
+	 * 顶部占位高度 = 切片首行往上「没渲染的那些行 + 日月头」的高度。
+	 * 切片正好落在某天第一行时，那一组会画日头（可能还有月头），占位要把它们减掉。
+	 */
+	const spacerTopStyle = computed((): string => {
+		const lo = sliceStart.value
+		const n = cellTops.length
+		if (n == 0 || lo <= 0 || lo >= n) {
+			return 'height: 0px;'
+		}
+		let top = cellTops[lo]
+		const gs = groups.value
+		for (let i = 0; i < gs.length; i++) {
+			const g = gs[i]
+			if (g.firstIdx == lo) {
+				top = top - dayRowPx - (g.showMonth ? monthRowPx : 0.0)
+				break
+			}
+			if (g.firstIdx > lo) {
+				break
+			}
+		}
+		const h = top - headPx
+		return 'height: ' + (h > 0 ? h : 0).toString() + 'px;'
+	})
+
+	/** 底部占位高度 = 切片末行行底到内容底 */
+	const spacerBottomStyle = computed((): string => {
+		const hi = sliceEnd.value
+		const n = cellTops.length
+		if (n == 0 || hi < 0) {
+			return 'height: 0px;'
+		}
+		const last = hi >= n ? n - 1 : hi
+		const renderedBottom = cellTops[last] + cellPx
+		const end = cellTops[n - 1] + cellPx
+		const h = end - renderedBottom
+		return 'height: ' + (h > 0 ? h : 0).toString() + 'px;'
+	})
+
+	/** 鉴权类错误：token 失效 / 未授权，需要重新登录 */
+	function isAuthError(msg: string): boolean {
+		return msg.indexOf('401') >= 0 ||
+			msg.indexOf('5001') >= 0 ||
+			msg.indexOf('未授权') >= 0 ||
+			msg.indexOf('鉴权') >= 0 ||
+			msg.indexOf('token') >= 0 ||
+			msg.indexOf('Token') >= 0
+	}
+
+	function redirectToLogin() {
+		if (redirecting) {
+			return
+		}
+		redirecting = true
+		stopTvKeyHook(keyHook)
+		logout()
+		uni.reLaunch({ url: '/pages/index/index' })
+	}
+
+	function failWith(msg: string) {
+		errorText.value = msg
+		if (isAuthError(msg)) {
+			redirectToLogin()
+		}
+	}
+
+
+
+	/** 滚动内容总高度（px）：最后一行顶部 + 一行高度 + 底部留白 */
+	function contentHeight(): number {
+		if (cellTops.length == 0) {
+			return 0.0
+		}
+		return cellTops[cellTops.length - 1] + cellPx + TAIL_RPX * unit
+	}
+
+	/**
+	 * 定位到指定位置。scrollTop 绑定的值没变化时不会触发滚动，
+	 * 所以相同值先挪 1px 再在绘制前回到目标。
+	 */
+	function applyScrollTop(v: number) {
+		const max = contentHeight() - viewportPx
+		let target = v < 0.0 ? 0.0 : v
+		if (max > 0.0 && target > max) {
+			target = max
+		}
+		if (target == scrollTop.value) {
+			scrollTop.value = target + 1.0
+			Promise.resolve().then(() => {
+				scrollTop.value = target
+				currentScroll = target
+			})
+		} else {
+			scrollTop.value = target
+			currentScroll = target
+		}
+	}
+
+	/**
+	 * 行表 `[首张下标, 该行张数, ...]`：同一行里的照片 `cellTops` 相同。
+	 * 上下移动按它算，组末不满一行也不会错位。
+	 *
+	 * 只在 `rebuildTops()` 之后重算一次（以前每次按键都 O(n) 重建一遍）。
+	 */
+	function rebuildRows() {
+		const out: Array<number> = []
+		const n = cellTops.length
+		let i = 0
+		while (i < n) {
+			const top = cellTops[i]
+			let j = i + 1
+			while (j < n && cellTops[j] == top) {
+				j = j + 1
+			}
+			out.push(i)
+			out.push(j - i)
+			i = j
+		}
+		rowTable = out
+	}
+
+	/** 某张照片所在行的第一格下标（行对齐） */
+	function rowStartOf(idx: number): number {
+		const n = cellTops.length
+		if (n == 0) {
+			return 0
+		}
+		let i = idx < 0 ? 0 : idx
+		if (i >= n) {
+			i = n - 1
+		}
+		const top = cellTops[i]
+		while (i > 0 && cellTops[i - 1] == top) {
+			i = i - 1
+		}
+		return i
+	}
+
+	/** 某张照片所在行的最后一格下标（行对齐） */
+	function rowEndOf(idx: number): number {
+		const n = cellTops.length
+		if (n == 0) {
+			return 0
+		}
+		let i = idx < 0 ? 0 : idx
+		if (i >= n) {
+			i = n - 1
+		}
+		const top = cellTops[i]
+		while (i + 1 < n && cellTops[i + 1] == top) {
+			i = i + 1
+		}
+		return i
+	}
+
+	/**
+	 * 重算渲染切片：只有光标逼近切片边缘时才真的重算。
+	 * 每次重算都会换掉一批 DOM 节点，所以必须有滞回，否则每个方向键都重排。
+	 */
+	function ensureSlice() {
+		const n = photos.value.length
+		if (n == 0) {
+			sliceStart.value = 0
+			sliceEnd.value = -1
+			return
+		}
+		const guard = SLICE_GUARD_ROWS * COLS
+		const cur = cursorIdx.value
+		if (sliceEnd.value >= sliceStart.value &&
+			cur >= sliceStart.value + guard && cur <= sliceEnd.value - guard) {
+			return
+		}
+		sliceStart.value = rowStartOf(cur - SLICE_ROWS_ABOVE * COLS)
+		sliceEnd.value = rowEndOf(cur + SLICE_ROWS_BELOW * COLS)
+	}
+
+	/**
+	 * 重算每张照片的顶部偏移。
+	 * uvue 没有焦点树也拿不到元素位置，按「组头 + 行」自己累加（与样式常量一一对应）。
+	 */
+	function rebuildTops() {
+		const tops: Array<number> = []
+		const n = photos.value.length
+		if (n == 0) {
+			cellTops = tops
+			rowTable = []
+			return
+		}
+		// 滚动内容以相册信息条开头，第一组分组头的起点在它下面
+		let y = headPx
+		let rowTop = 0.0
+		let colInRow = 0
+		let lastDay = ''
+		let lastMonth = ''
+		for (let i = 0; i < n; i++) {
+			const p = photos.value[i]
+			const dayKey = p.dt.length >= 10 ? p.dt.substring(0, 10) : p.dt
+			const monthKey = p.dt.length >= 7 ? p.dt.substring(0, 7) : p.dt
+			if (dayKey != lastDay) {
+				// 上一行没排满时，新分组从下一行开始
+				if (colInRow > 0) {
+					y = rowTop + cellPx
+				}
+				if (monthKey != lastMonth) {
+					y = y + monthRowPx
+					lastMonth = monthKey
+				}
+				y = y + dayRowPx
+				lastDay = dayKey
+				rowTop = y
+				colInRow = 0
+			}
+			if (colInRow == 0) {
+				rowTop = y
+			}
+			tops.push(rowTop)
+			colInRow = colInRow + 1
+			if (colInRow == COLS) {
+				colInRow = 0
+				y = rowTop + cellPx
+			}
+		}
+		cellTops = tops
+		rebuildRows()
+		// 兜底：光标下标必须落在已加载范围内，否则浮动框会指到不存在的格子（= 光标消失）
+		if (cursorIdx.value >= n) {
+			cursorIdx.value = n - 1
+		}
+		if (cursorIdx.value < 0) {
+			cursorIdx.value = 0
+		}
+		// 行高变了：通知浮动光标重算位置
+		topsVersion.value = topsVersion.value + 1
+		// 切片依赖新行高，重建后立刻重算一次
+		ensureSlice()
+	}
+
+	/** 视口顶部第一张照片的下标（web 滚轮滚动时反推光标用） */
+	function indexAtScroll(top: number): number {
+		let idx = 0
+		for (let i = 0; i < cellTops.length; i++) {
+			if (cellTops[i] <= top + 1.0) {
+				idx = i
+			} else {
+				break
+			}
+		}
+		return idx
+	}
+
+	/**
+	 * 记录实际滚动位置。
+	 *
+	 * **只有 web 端**才按滚动位置反推光标（浏览器有滚轮 / 触控板，用户可能自己滚）；
+	 * 电视上滚动永远由光标驱动 —— 以前这段在两端都跑，按键触发的滚动动画每帧都会
+	 * 用「视口顶部那张」覆盖 cursorIdx，与之打架：
+	 * 表现为翻得久了光标乱跳 / 看不到光标，而且每帧都要 O(n) 扫一遍 cellTops（卡顿）。
+	 */
+	function onScroll(e: UniScrollEvent) {
+		// #ifdef WEB
+		const top = e.detail.scrollTop
+		// 与「自己滚之前的位置」比较：相等说明这帧的滚动是我们自己设的（回声）
+		const echo = Math.abs(top - currentScroll) <= 4.0
+		// #endif
+		currentScroll = e.detail.scrollTop
+		// #ifdef WEB
+		if (Date.now() < cursorLockUntil || echo) {
+			return
+		}
+		cursorIdx.value = indexAtScroll(top + cellPx * 0.3)
+		ensureSlice()
+		// #endif
+	}
+
+
+	/** 同一列上下移动一行；越界返回 -1 */
+	function moveRowIndex(idx: number, dir: number): number {
+		const rows = rowTable
+		let ri = -1
+		let col = 0
+		for (let i = 0; i < rows.length; i += 2) {
+			const start = rows[i]
+			const cnt = rows[i + 1]
+			if (idx >= start && idx < start + cnt) {
+				ri = i / 2
+				col = idx - start
+				break
+			}
+		}
+		if (ri < 0) {
+			return -1
+		}
+		const tr = ri + dir
+		if (tr < 0 || tr >= rows.length / 2) {
+			return -1
+		}
+		const tStart = rows[tr * 2]
+		const tCnt = rows[tr * 2 + 1]
+		return tStart + (col < tCnt ? col : tCnt - 1)
+	}
+
+	/** 同一行内左右移动一格；到行首 / 行尾返回 -1 */
+	function moveColIndex(idx: number, dir: number): number {
+		const rows = rowTable
+		for (let i = 0; i < rows.length; i += 2) {
+			const start = rows[i]
+			const cnt = rows[i + 1]
+			if (idx >= start && idx < start + cnt) {
+				const col = idx - start
+				if (dir < 0) {
+					return col > 0 ? idx - 1 : -1
+				}
+				return col < cnt - 1 ? idx + 1 : -1
+			}
+		}
+		return -1
+	}
+
+	/** 让光标那张可见：只有它要出视口时才滚动 */
+	function ensureCursorVisible() {
+		if (cursorIdx.value < 0 || cursorIdx.value >= cellTops.length) {
+			return
+		}
+		const top = cellTops[cursorIdx.value]
+		const pad = cellPx * 0.25
+		cursorLockUntil = Date.now() + 300
+		if (top - pad < currentScroll) {
+			applyScrollTop(top - pad)
+		} else if (top + cellPx + pad > currentScroll + viewportPx) {
+			applyScrollTop(top + cellPx + pad - viewportPx)
+		}
+	}
+
+	async function loadDetail() {
+		const res = await albumDetail(albumId)
+		if (!res.ok) {
+			failWith(res.error.length > 0 ? res.error : '相册信息获取失败')
+			return
+		}
+		albumName.value = res.name
+		cover.value = res.cover
+		photoCount.value = res.photoCount
+		videoCount.value = res.videoCount
+		startText.value = res.start
+	}
+
+	async function loadPage() {
+		if (loading.value || atEnd.value) {
+			return
+		}
+		loading.value = true
+		try {
+			const res = await albumPhotos(albumId, offset, PAGE_SIZE, asc.value)
+			if (!res.ok) {
+				failWith(res.error.length > 0 ? res.error : '相册照片加载失败')
+				return
+			}
+			const next: Array<PhotoItem> = photos.value.slice()
+			for (let i = 0; i < res.items.length; i++) {
+				const it = res.items[i]
+				next.push({
+					id: it.id,
+					dt: it.dt,
+					cat: it.cat,
+					w: it.w,
+					h: it.h,
+					live: it.live,
+					thumb: it.thumb,
+					medium: it.medium,
+					original: it.original,
+					name: it.name,
+					video: it.video,
+					duration: it.duration
+				} as PhotoItem)
+			}
+			photos.value = next
+			offset = offset + res.items.length
+			if (res.items.length < PAGE_SIZE) {
+				atEnd.value = true
+			}
+			rebuildTops()
+		} catch (e) {
+			failWith((e as Error).message)
+		} finally {
+			loading.value = false
+		}
+	}
+
+	/** 切排序方向：清空当前列表，从第一页重拉（分组、行高都跟着重算） */
+	function onToggleSort() {
+		if (loading.value) {
+			return
+		}
+		asc.value = !asc.value
+		photos.value = []
+		offset = 0
+		atEnd.value = false
+		errorText.value = ''
+		cellTops = []
+		cursorIdx.value = 0
+		detailLog('[detail] toggle sort asc=' + (asc.value ? '1' : '0'))
+		applyScrollTop(0.0)
+		loadPage()
+	}
+
+	function onLower() {
+		loadPage()
+	}
+
+	function onBack() {
+		stopTvKeyHook(keyHook)
+		uni.navigateBack({})
+	}
+
+	/** 顶栏「返回」按钮的焦点样式 */
+	function backClass(): string {
+		return barFocus.value == 0 ? 'nav-back-focus' : ''
+	}
+
+	/** 顶栏「排序」按钮的焦点样式 */
+	function sortClass(): string {
+		return barFocus.value == 1 ? 'sort-focus' : ''
+	}
+
+	/** 层「detail.bar」：顶栏焦点（返回 / 排序），上下键回网格 */
+	function onBarKey(code: number): boolean {
+		if (code == KEY_LEFT || code == KEY_RIGHT) {
+			barFocus.value = barFocus.value == 0 ? 1 : 0
+		} else if (code == KEY_OK || code == KEY_ENTER) {
+			if (barFocus.value == 0) {
+				onBack()
+			} else {
+				onToggleSort()
+			}
+		} else if (code == KEY_DOWN) {
+			barFocus.value = -1
+		} else if (code == KEY_BACK) {
+			barFocus.value = -1
+			onBack()
+		}
+		detailLog('[detail] bar key=' + code.toString() + ' f=' + barFocus.value.toString())
+		return true
+	}
+
+	/** 打开查看器：只切状态，具体加载交给组件（它会订阅按键，页面这段就先让位） */
+	function openViewer(idx: number) {
+		detailLog('[detail] openViewer idx=' + idx.toString() + ' photos=' + photos.value.length.toString())
+		if (idx < 0 || idx >= photos.value.length) {
+			return
+		}
+		viewerIndex.value = idx
+		viewerOpen.value = true
+	}
+
+	/** 组件要换下一张 / 上一张：只有页面知道列表有多长 */
+	function onViewerNav(delta: number) {
+		const next = viewerIndex.value + delta
+		if (next < 0 || next >= photos.value.length) {
+			return
+		}
+		viewerIndex.value = next
+	}
+
+	/**
+	 * 层「detail.grid」：相册内页网格（仅网格状态；查看器打开期间按键由 PhotoViewer 组件接管）。
+	 *   上下左右移动**光标**（出视口才滚），OK 打开光标那张，返回回相册列表。
+	 */
+	function onGridKey(code: number): boolean {
+		if (code == KEY_BACK) {
+			onBack()
+			return true
+		}
+		const n = photos.value.length
+		if (n == 0) {
+			detailLog('[detail] key=' + code.toString() + ' photos=0（照片还没加载到）')
+			return false
+		}
+		if (code == KEY_UP) {
+			const t = moveRowIndex(cursorIdx.value, -1)
+			if (t >= 0) {
+				cursorIdx.value = t
+				ensureCursorVisible()
+			} else {
+				// 已经在第一行：焦点交给顶栏（排序在那里）
+				barFocus.value = 1
+			}
+		} else if (code == KEY_DOWN) {
+			const t = moveRowIndex(cursorIdx.value, 1)
+			if (t >= 0) {
+				cursorIdx.value = t
+			} else if (!atEnd.value && !loading.value) {
+				// 已在最后一行：补下一页（光标不动）
+				loadPage()
+			}
+			ensureCursorVisible()
+		} else if (code == KEY_LEFT) {
+			const t = moveColIndex(cursorIdx.value, -1)
+			if (t >= 0) {
+				cursorIdx.value = t
+			}
+			ensureCursorVisible()
+		} else if (code == KEY_RIGHT) {
+			const t = moveColIndex(cursorIdx.value, 1)
+			if (t >= 0) {
+				cursorIdx.value = t
+			}
+			ensureCursorVisible()
+		} else if (code == KEY_OK || code == KEY_ENTER) {
+			openViewer(cursorIdx.value)
+		} else {
+			return false
+		}
+		ensureSlice()
+		detailLog('[detail] key=' + code.toString() + ' cursor=' + cursorIdx.value.toString() +
+			' photos=' + photos.value.length.toString() + ' tops=' + cellTops.length.toString() +
+			' rows=' + Math.floor(rowTable.length / 2).toString())
+		return true
+	}
+
+	/** 层名 → 处理函数（UTS 不能把函数放进容器，所以用名字查表） */
+	function runKeyLayer(layer: string, code: number): boolean {
+		if (layer == 'detail.bar') {
+			return onBarKey(code)
+		}
+		if (layer == 'detail.grid') {
+			return onGridKey(code)
+		}
+		return false
+	}
+
+	/** 遥控器入口（T5 分发层）：网格在底，顶栏焦点压在栈顶，查看器自己独占通道 */
+	function handleKey(code: number) {
+		const stack: Array<string> = []
+		stack.push('detail.grid')
+		if (barFocus.value >= 0) {
+			stack.push('detail.bar')
+		}
+		dispatchKey(code, stack, (layer: string, c: number): boolean => {
+			return runKeyLayer(layer, c)
+		})
+	}
+
+	function armKeyHook() {
+		keyHook = startTvKeyHook((code: number) => {
+			handleKey(code)
+		})
+	}
+
+	/**
+	 * 组件关掉后把按键通道收回来（组件卸载时的 stop 因 id 不匹配会被忽略）。
+	 * 定义在 `armKeyHook` 之后：UTS 不支持函数提升（见 AGENTS 5.2 第一条）。
+	 */
+	function onViewerClose() {
+		viewerOpen.value = false
+		// 光标落在刚才看的那张上（与图库一致），并把页面滚到它可见
+		if (viewerIndex.value >= 0 && viewerIndex.value < photos.value.length) {
+			cursorIdx.value = viewerIndex.value
+			ensureCursorVisible()
+			ensureSlice()
+		}
+		armKeyHook()
+	}
+
+	onLoad((options: OnLoadOptions) => {
+		let idText = ''
+		const raw = options['id']
+		if (raw != null) {
+			idText = raw.toString()
+		}
+		const id = parseInt(idText)
+		if (isNaN(id) || id <= 0) {
+			errorText.value = '相册 ID 无效'
+			return
+		}
+		albumId = id
+		const info = uni.getWindowInfo()
+		unit = info.windowWidth / 750.0
+		cellPx = (cellSizeRpx() + CELL_MARGIN_RPX) * unit
+		monthRowPx = MONTH_ROW_RPX * unit
+		dayRowPx = DAY_ROW_RPX * unit
+		headPx = HEAD_RPX * unit
+		// 导航栏 60 + 间距 8 + 页面内边距 12 + 底部 8 ≈ 88rpx（信息条已在滚动内容里）
+		viewportPx = info.windowHeight - 88.0 * unit
+		armKeyHook()
+		loadDetail()
+		loadPage()
+	})
+
+	onShow(() => {
+		armKeyHook()
+	})
+
+	onUnload(() => {
+		stopTvKeyHook(keyHook)
+	})
+</script>
+
+<style>
+	.page {
+		flex: 1;
+		position: relative;
+		background-color: #141418;
+		padding: 6rpx;
+	}
+
+	/* ---------------- 顶栏 ---------------- */
+
+	.navbar {
+		height: 60rpx;
+		flex-direction: row;
+		align-items: center;
+		justify-content: space-between;
+		padding-left: 2rpx;
+		padding-right: 2rpx;
+		margin-bottom: 8rpx;
+		background-color: #101014;
+	}
+
+	.nav-left {
+		flex-direction: row;
+		align-items: center;
+		flex: 1;
+	}
+
+	/* 恒留 2rpx 透明边框：焦点只改颜色，避免撑开尺寸 */
+	.nav-back {
+		width: 24rpx;
+		height: 24rpx;
+		flex-direction: row;
+		align-items: center;
+		justify-content: center;
+		border-radius: 6rpx;
+		background-color: #17171C;
+		border-width: 2rpx;
+		border-style: solid;
+		border-color: rgba(0, 0, 0, 0);
+		box-sizing: border-box;
+	}
+
+	.nav-back-text {
+		font-size: 16rpx;
+		color: #C6C6CB;
+	}
+
+	/* flex:1 让长名字被裁切，而不是把右侧排序按钮挤出去 */
+	.nav-title {
+		flex: 1;
+		font-size: 17rpx;
+		font-weight: bold;
+		color: #FFFFFF;
+		margin-left: 8rpx;
+		overflow: hidden;
+		white-space: nowrap;
+		text-overflow: ellipsis;
+	}
+
+	.nav-right {
+		flex-direction: row;
+		align-items: center;
+	}
+
+	/* 排序：唯一保留的顶部功能，点一下切 升/降 序 */
+	.sort-btn {
+		height: 26rpx;
+		flex-direction: row;
+		align-items: center;
+		padding-left: 9rpx;
+		padding-right: 9rpx;
+		border-radius: 13rpx;
+		background-color: #17171C;
+		border-width: 1rpx;
+		border-style: solid;
+		border-color: #2A2A32;
+	}
+
+	.sort-label {
+		font-size: 11rpx;
+		color: #C6C6CB;
+	}
+
+	.sort-arrow {
+		font-size: 12rpx;
+		color: #3388FF;
+		margin-left: 3rpx;
+	}
+
+	/* 遥控器焦点：蓝底 + 白描边（TV 上只改描边看不出来） */
+	.nav-back-focus {
+		border-width: 2rpx;
+		border-style: solid;
+		border-color: #FFFFFF;
+		background-color: #3388FF;
+	}
+
+	.sort-focus {
+		background-color: #3388FF;
+		border-color: #FFFFFF;
+	}
+
+	/* ---------------- 相册信息 ---------------- */
+
+	.head {
+		height: 76rpx;
+		flex-direction: row;
+		align-items: center;
+		margin-bottom: 8rpx;
+		padding-left: 2rpx;
+		padding-right: 2rpx;
+	}
+
+	.head-cover {
+		width: 60rpx;
+		height: 60rpx;
+		border-radius: 8rpx;
+		overflow: hidden;
+		background-color: #1E1E21;
+	}
+
+	.head-body {
+		flex: 1;
+		flex-direction: column;
+		justify-content: center;
+		margin-left: 10rpx;
+	}
+
+	.head-name {
+		font-size: 17rpx;
+		font-weight: bold;
+		color: #FFFFFF;
+	}
+
+	.head-meta {
+		font-size: 11rpx;
+		color: #8A8B8E;
+		margin-top: 3rpx;
+	}
+
+	.head-range {
+		font-size: 10rpx;
+		color: #6E6F72;
+		margin-top: 2rpx;
+	}
+
+	/* ---------------- 照片网格 ---------------- */
+
+	.body {
+		flex: 1;
+	}
+
+	.group {
+		flex-direction: column;
+	}
+
+	.month-row {
+		height: 30rpx;
+		flex-direction: row;
+		align-items: flex-end;
+		padding-left: 3rpx;
+		padding-bottom: 4rpx;
+	}
+
+	.month-text {
+		font-size: 14rpx;
+		font-weight: bold;
+		color: #FFFFFF;
+	}
+
+	.day-row {
+		height: 24rpx;
+		flex-direction: row;
+		align-items: center;
+		padding-left: 3rpx;
+	}
+
+	.day-text {
+		font-size: 11rpx;
+		color: #8A8B8E;
+	}
+
+	.cells {
+		flex-direction: row;
+		flex-wrap: wrap;
+	}
+
+	/* 虚拟列表的上下占位：高度由 spacerTopStyle / spacerBottomStyle 给（px） */
+	.spacer {
+		width: 100%;
+	}
+
+	/* 滚动内容的相对定位容器：浮动光标（.cell-cursor）以它为坐标原点，随内容一起滚 */
+	.inner {
+		position: relative;
+		flex-direction: column;
+	}
+
+	.cell {
+		position: relative;
+		border-radius: 8rpx;
+		background-color: #232328;
+		overflow: hidden;
+	}
+
+	/* 遥控器光标：整页唯一的一个浮动框（位置由 cursorBoxStyle 算，见脚本）
+	   绝对定位 + 不吃布局，所以移动光标不会引起任何重排/重绘整张网格 */
+	.cell-cursor {
+		position: absolute;
+		z-index: 4;
+		border-width: 4rpx;
+		border-style: solid;
+		border-color: #3388FF;
+		border-radius: 8rpx;
+		background-color: rgba(51, 136, 255, 0.16);
+	}
+
+	/* 焦点跑到顶栏（返回 / 排序）：只留一圈暗框，避免两处都像"当前焦点" */
+	.cell-cursor-idle {
+		border-color: #4A4C56;
+		background-color: rgba(0, 0, 0, 0);
+	}
+
+	/* 视频角标：左下角深色半透明胶囊（与图库页同一套尺寸） */
+	.cell-tag {
+		position: absolute;
+		left: 4rpx;
+		bottom: 4rpx;
+		height: 13rpx;
+		flex-direction: row;
+		align-items: center;
+		padding-left: 3rpx;
+		padding-right: 4rpx;
+		border-radius: 4rpx;
+		background-color: rgba(0, 0, 0, 0.55);
+	}
+
+	.cell-tag-icon {
+		font-size: 7rpx;
+		color: #FFFFFF;
+		margin-right: 2rpx;
+	}
+
+	.cell-tag-text {
+		font-size: 8rpx;
+		color: #FFFFFF;
+	}
+
+	/* 实况照片的同心圆图标（纯 view 拼，不用图片 / emoji） */
+	.live-ring {
+		width: 8rpx;
+		height: 8rpx;
+		border-radius: 4rpx;
+		border-width: 1rpx;
+		border-style: solid;
+		border-color: #FFFFFF;
+		align-items: center;
+		justify-content: center;
+		margin-right: 2rpx;
+	}
+
+	.live-core {
+		width: 3rpx;
+		height: 3rpx;
+		border-radius: 2rpx;
+		background-color: #FFFFFF;
+	}
+
+	/* ---------------- 状态 ---------------- */
+
+	.loading {
+		height: 40rpx;
+		flex-direction: row;
+		align-items: center;
+		justify-content: center;
+	}
+
+	.loading-text {
+		font-size: 12rpx;
+		color: #6E6F72;
+	}
+
+	.empty {
+		height: 160rpx;
+		flex-direction: row;
+		align-items: center;
+		justify-content: center;
+	}
+
+	.empty-text {
+		font-size: 13rpx;
+		color: #6E6F72;
+	}
+
+	/* 查看器的样式全部在 components/PhotoViewer.uvue 里（与图库页共用） */
+</style>

@@ -1,0 +1,18 @@
+/**
+ * 首页大屏（pages/home/home.uvue）的场景分类项。
+ *
+ * 数据来自插件 `smartCategories()`（`/p/api/v1/ai-smart-rec/categories?mainCategory=scene`，
+ * 对应网页版 `/p/smart_category`）。页面里再转一层，是因为插件返回的类型定义在
+ * `uni_modules/fnos-auth/utssdk/interface.uts`，页面不直接引用 uni_modules 内部文件
+ * （与图库 / 相册共用 `common/photo.uts` 的理由相同）。
+ */
+export type SceneItem = {
+  /** 场景名，如「夜景」「海滩」 */
+  name: string
+  /** 该场景下的照片 + 视频数量 */
+  count: number
+  /** 全屏背景海报路径（m 尺寸，约 150KB，需 image() 下载） */
+  cover: string
+  /** 卡片封面路径（s 尺寸，约 15KB，需 thumb() 下载） */
+  thumb: string
+}

@@ -1,0 +1,63 @@
+{
+	"id": "nasphoto-tv-uniappx",
+	"name": "NasPhotoTV",
+	"appid": "__UNI__1B208D1",
+	"description": "飞牛 fnOS 相册 TV 端（uni-app x）：AccessToken 登录鉴权脚手架",
+	"versionName": "0.1.0",
+	"versionCode": 100,
+	"uni-app-x": {
+		"flex-direction": "column",
+		"vapor": false
+	},
+	"app": {
+		"defaultAppTheme": "dark",
+		"distribute": {
+			"android": {
+				"minSdkVersion": 21,
+				"targetSdkVersion": 32,
+				"abiFilters": [
+					"arm64-v8a",
+					"armeabi-v7a"
+				],
+				"permissions": [
+					"<uses-permission android:name=\"android.permission.INTERNET\"/>",
+					"<uses-permission android:name=\"android.permission.ACCESS_NETWORK_STATE\"/>"
+				]
+			}
+		}
+	},
+	"app-android": {
+		"defaultAppTheme": "dark",
+		"distribute": {
+			"packagename": "com.grfntv",
+			"minSdkVersion": 21,
+			"targetSdkVersion": 32,
+			"abiFilters": [
+				"arm64-v8a",
+				"armeabi-v7a"
+			],
+			"permissions": [
+				"<uses-permission android:name=\"android.permission.INTERNET\"/>",
+				"<uses-permission android:name=\"android.permission.ACCESS_NETWORK_STATE\"/>"
+			],
+			"modules": {},
+			"icons": {},
+			"splashScreens": {
+				"default": {}
+			}
+		}
+	},
+	"app-ios": {
+		"defaultAppTheme": "dark",
+		"distribute": {
+			"modules": {},
+			"icons": {},
+			"splashScreens": {}
+		}
+	},
+	"web": {
+		"router": {
+			"mode": ""
+		}
+	}
+}

@@ -1,0 +1,923 @@
+<template>
+	<view class="page">
+		<!-- 自动登录 / 恢复登录中：整页盖住，只显示 logo + 提示。
+		     各页面遇到 401 会把用户送回本页自动重登，有这层就不会「闪一下登录表单」 -->
+		<view class="auto-mask" v-if="autoBusy">
+			<image class="auto-logo" src="/static/logo-256.png" mode="aspectFit" />
+			<text class="auto-text">正在恢复登录…</text>
+		</view>
+
+		<!-- 顶部 -->
+		<view class="header">
+			<view class="brand">
+				<!-- 品牌图标：官方 logo（static/logo-256.png，52rpx≈130px 够清晰） -->
+				<image class="logo" src="/static/logo-256.png" mode="aspectFit" />
+				<view class="titles">
+					<text class="title">飞牛相册 · TV 登录</text>
+					<text class="subtitle">uni-app x · fnOS AccessToken 鉴权</text>
+				</view>
+			</view>
+			<view class="chip" :class="connected ? 'chip-on' : 'chip-off'">
+				<text class="chip-text">{{ statusText }}</text>
+			</view>
+		</view>
+
+		<!-- 主体 -->
+		<view class="content">
+			<!-- 左：连接配置 -->
+			<view class="panel">
+				<text class="panel-title">连接配置</text>
+
+				<view class="row" :class="rowClass(0)" @click="activate(0)">
+					<text class="row-label">服务器</text>
+					<text class="row-value">{{ host }}</text>
+				</view>
+
+				<view class="row" :class="rowClass(1)" @click="activate(1)">
+					<text class="row-label">端口</text>
+					<text class="row-value">{{ port }}</text>
+				</view>
+
+				<view class="row" :class="rowClass(2)" @click="activate(2)">
+					<text class="row-label">账号</text>
+					<text class="row-value">{{ username }}</text>
+				</view>
+
+				<view class="row" :class="rowClass(3)" @click="activate(3)">
+					<text class="row-label">密码</text>
+					<text class="row-value">{{ passwordMasked }}</text>
+				</view>
+
+				<view class="row" :class="rowClass(4)" @click="activate(4)">
+					<text class="row-label">访问码</text>
+					<text class="row-value">{{ accessCodeMasked }}</text>
+				</view>
+
+				<view class="row" :class="rowClass(5)" @click="activate(5)">
+					<text class="row-label">协议</text>
+					<text class="row-value">{{ useHttps ? 'HTTPS（自签证书）' : 'HTTP' }}</text>
+				</view>
+
+				<view class="action" :class="actionClass(6)" @click="activate(6)">
+					<text class="action-text">{{ busy ? '登录中…' : '登录 / 测试连接' }}</text>
+				</view>
+
+				<view class="action" :class="actionClass(7)" @click="activate(7)">
+					<text class="action-text">清除 token</text>
+				</view>
+			</view>
+
+			<!-- 右：鉴权状态 -->
+			<view class="panel side">
+				<text class="panel-title">鉴权状态</text>
+
+				<view class="kv">
+					<text class="kv-key">AccessToken</text>
+					<text class="kv-val">{{ tokenText }}</text>
+				</view>
+
+				<view class="kv">
+					<text class="kv-key">设备标识</text>
+					<text class="kv-val">{{ deviceText }}</text>
+				</view>
+
+				<view class="error-box" v-if="errorText.length > 0">
+					<text class="error-text">{{ errorText }}</text>
+				</view>
+
+				<view class="hint">
+					<text class="hint-text">首次连接会记住 NAS 的自签证书指纹（TOFU）；AccessToken 只保存在内存，重启应用会重新登录。账号与设备标识写入本地，用于「信任此设备」和自动重登。</text>
+				</view>
+			</view>
+		</view>
+
+		<!-- 自动登录诊断串（排查用；放在底部提示**上面**，避免贴着屏幕边缘被裁掉） -->
+		<view class="diag" v-if="diagText.length > 0">
+			<text class="diag-text">{{ diagText }}</text>
+		</view>
+
+		<!-- 底部提示 -->
+		<view class="footer">
+			<text class="footer-text">方向键移动 · OK 编辑 / 确认 · 返回键取消</text>
+		</view>
+
+		<!-- 编辑弹窗 -->
+		<view class="overlay" v-if="editing">
+			<view class="dialog">
+				<text class="dialog-label">{{ editLabel }}</text>
+				<input
+					class="dialog-input"
+					:focus="true"
+					v-model="editValue"
+					@confirm="confirmEdit"
+				/>
+				<view class="dialog-actions">
+					<view class="dialog-btn" :class="editFocus == 0 ? 'dialog-btn dialog-btn-on' : 'dialog-btn'" @click="confirmEdit">
+						<text class="dialog-btn-text">确定</text>
+					</view>
+					<view class="dialog-btn" :class="editFocus == 1 ? 'dialog-btn dialog-btn-on' : 'dialog-btn'" @click="cancelEdit">
+						<text class="dialog-btn-text">取消</text>
+					</view>
+				</view>
+				<text class="dialog-tip">遥控器 OK 确定，返回键取消</text>
+			</view>
+		</view>
+
+		<!-- 两步验证弹窗 -->
+		<view class="overlay" v-if="show2fa">
+			<view class="dialog">
+				<text class="dialog-label">两步验证</text>
+				<text class="dialog-desc">{{ errorText.length > 0 ? errorText : '请输入验证器 App 中的 6 位动态码' }}</text>
+				<input
+					class="dialog-input"
+					:focus="true"
+					v-model="code2fa"
+					type="number"
+					:maxlength="6"
+					@confirm="confirm2fa"
+				/>
+				<view class="dialog-actions">
+					<view class="dialog-btn dialog-btn-on" @click="confirm2fa">
+						<text class="dialog-btn-text">确定</text>
+					</view>
+					<view class="dialog-btn" @click="cancel2fa">
+						<text class="dialog-btn-text">取消</text>
+					</view>
+				</view>
+			</view>
+		</view>
+	</view>
+</template>
+
+<script setup lang="uts">
+	import {
+		login,
+		verifyTwoFactor,
+		getToken,
+		logout,
+		getSavedConfig,
+		saveConfig,
+		startTvKeyHook,
+		stopTvKeyHook,
+		quitApp
+	} from '@/uni_modules/fnos-auth'
+	import { KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_OK, KEY_ENTER, KEY_BACK, dispatchKey } from '@/common/keys.uts'
+
+	// 可聚焦行：0-4 输入项，5 协议，6 登录，7 清除 token
+	const ROW_COUNT = 8
+
+	/** 本次页面的按键订阅 id（退订时原样传回，避免误关别的页面的通道） */
+	let keyHook = 0
+	/** 返回键二次确认：true = 已经按过一次「返回」（2.5 秒内再按就退出） */
+	const exitArmed = ref(false)
+	let exitTimer = 0
+
+	const host = ref('192.168.31.216')
+	const port = ref('5666')
+	const username = ref('')
+	const password = ref('')
+	const accessCode = ref('')
+	const useHttps = ref(false)
+
+	const focusIndex = ref(0)
+
+	const editing = ref(false)
+	const editKey = ref('')
+	const editLabel = ref('')
+	const editValue = ref('')
+	const editFocus = ref(0)
+
+	const show2fa = ref(false)
+	const code2fa = ref('')
+
+	const busy = ref(false)
+	/**
+	 * 自动登录进行中：整页盖一层「正在恢复登录…」。
+	 *
+	 * 为什么要盖：token 失效（退出到桌面再进 App 最常见）时，各页面会把用户送回本页自动重登；
+	 * 如果不盖，用户会看到登录表单「闪一下」又跳回首页（2026-11-24 反馈）。
+	 */
+	const autoBusy = ref(false)
+	/** 最近一次自动登录失败的原因（把它显示出来，不然只能看到「自动登录已暂停」这种笼统提示） */
+	let lastAutoError = ''
+	/**
+	 * 自动登录诊断串（配置是否读到 / 账号密码长度 / 内存 token 长度）。
+	 * 电视上拿不到 logcat，只能把现场画在屏幕上，出问题一眼就能看出是哪一环。
+	 */
+	const diagText = ref('')
+	const connected = ref(false)
+	const statusText = ref('未登录')
+	const tokenText = ref('—')
+	const deviceText = ref('未注册')
+	const errorText = ref('')
+
+	const passwordMasked = computed((): string => {
+		return password.value.length > 0 ? '已填写' : '未填写'
+	})
+
+	const accessCodeMasked = computed((): string => {
+		return accessCode.value.length > 0 ? '已填写' : '未填写'
+	})
+
+	function rowClass(index: number): string {
+		return focusIndex.value == index ? 'row row-focus' : 'row'
+	}
+
+	function actionClass(index: number): string {
+		return focusIndex.value == index ? 'action action-focus' : 'action'
+	}
+
+	function maskToken(token: string): string {
+		if (token.length <= 16) {
+			return token
+		}
+		return token.substring(0, 8) + '…' + token.substring(token.length - 6)
+	}
+
+	function openEdit(key: string, label: string, value: string) {
+		editKey.value = key
+		editLabel.value = label
+		editValue.value = value
+		editFocus.value = 0
+		editing.value = true
+	}
+
+	function confirmEdit() {
+		if (editKey.value == 'host') {
+			host.value = editValue.value.trim()
+		} else if (editKey.value == 'port') {
+			port.value = editValue.value.trim()
+		} else if (editKey.value == 'username') {
+			username.value = editValue.value.trim()
+		} else if (editKey.value == 'password') {
+			password.value = editValue.value
+		} else if (editKey.value == 'accessCode') {
+			accessCode.value = editValue.value.trim()
+		}
+		editing.value = false
+	}
+
+	function cancelEdit() {
+		editing.value = false
+	}
+
+	function cancel2fa() {
+		show2fa.value = false
+	}
+
+	function toggleProtocol() {
+		useHttps.value = !useHttps.value
+		// 端口还是默认值时跟着协议一起切，避免用户手改
+		if (port.value == '5666' || port.value == '5667') {
+			port.value = useHttps.value ? '5667' : '5666'
+		}
+	}
+
+	async function doLogin() {
+		if (busy.value) {
+			return
+		}
+		busy.value = true
+		errorText.value = ''
+		statusText.value = '正在登录…'
+		connected.value = false
+		try {
+			const typed = parseInt(port.value)
+			const p = typed > 0 ? typed : (useHttps.value ? 5667 : 5666)
+			const r = await login(host.value.trim(), p, useHttps.value, username.value.trim(), password.value, accessCode.value.trim())
+			if (r.ok) {
+				connected.value = true
+				statusText.value = '已登录，正在打开首页…'
+				tokenText.value = maskToken(r.token)
+				deviceText.value = '已注册（did 已持久化）'
+				saveConfig(host.value.trim(), p, useHttps.value, username.value.trim(), password.value, accessCode.value.trim())
+				stopTvKeyHook(keyHook)
+				uni.reLaunch({ url: '/pages/home/home' })
+			} else if (r.need2fa) {
+				statusText.value = '需要两步验证'
+				code2fa.value = ''
+				errorText.value = r.error
+				show2fa.value = true
+			} else {
+				statusText.value = '登录失败'
+				errorText.value = r.error
+				lastAutoError = r.error
+			}
+		} catch (e) {
+			statusText.value = '登录异常'
+			errorText.value = (e as Error).message
+			lastAutoError = (e as Error).message
+		} finally {
+			busy.value = false
+			// 自动登录这一轮结束（成功会 reLaunch，失败要把表单还给用户）
+			autoBusy.value = false
+		}
+	}
+
+	async function confirm2fa() {
+		if (busy.value) {
+			return
+		}
+		busy.value = true
+		errorText.value = ''
+		try {
+			const r = await verifyTwoFactor(code2fa.value)
+			if (r.ok) {
+				show2fa.value = false
+				connected.value = true
+				statusText.value = '已登录，正在打开首页…'
+				tokenText.value = maskToken(r.token)
+				stopTvKeyHook(keyHook)
+				uni.reLaunch({ url: '/pages/home/home' })
+			} else {
+				errorText.value = r.error
+				if (!r.need2fa) {
+					show2fa.value = false
+					statusText.value = '登录失败'
+				}
+			}
+		} catch (e) {
+			errorText.value = (e as Error).message
+		} finally {
+			busy.value = false
+		}
+	}
+
+	function doLogout() {
+		logout()
+		connected.value = false
+		statusText.value = '已清除 token'
+		tokenText.value = '—'
+		errorText.value = ''
+	}
+
+	/**
+	 * 自动登录节流：token 长期失效（比如 NAS 上改过密码）时，
+	 * 「图库 401 → 本页 → 自动登录 → 图库」会来回闪，所以 60 秒内最多自动尝试 3 次，
+	 * 超过就停下来等用户手动点「登录 / 测试连接」。
+	 * 注意 UTS 编译成 Kotlin 局部函数，必须先定义后使用。
+	 */
+	function allowAutoLogin(): boolean {
+		const now = Date.now()
+		const raw = uni.getStorageSync('fnos.autoTry')
+		const text = raw == null ? '' : raw.toString()
+		let first = 0
+		let count = 0
+		if (text.indexOf(':') > 0) {
+			const parts = text.split(':')
+			first = parseInt(parts[0])
+			count = parseInt(parts[1])
+			// NaN / 窗口过期都当作重新计数（NaN 参与比较恒为 false，所以用反向判断）
+			if (!(first > 0) || !(count >= 0) || now - first > 60000) {
+				first = now
+				count = 0
+			}
+		} else {
+			first = now
+		}
+		if (count >= 3) {
+			return false
+		}
+		uni.setStorageSync('fnos.autoTry', first.toString() + ':' + (count + 1).toString())
+		return true
+	}
+
+	// UTS 编译为 Kotlin 局部函数，必须「先定义后调用」，所以 activate/handleKey 放在这里
+	function activate(index: number) {
+		if (busy.value) {
+			return
+		}
+		if (index == 0) {
+			openEdit('host', '服务器地址（局域网 IP 或主机名）', host.value)
+		} else if (index == 1) {
+			openEdit('port', '端口（飞牛 Web 的 HTTP 端口，默认 5666）', port.value)
+		} else if (index == 2) {
+			openEdit('username', '飞牛账号', username.value)
+		} else if (index == 3) {
+			openEdit('password', '登录密码', password.value)
+		} else if (index == 4) {
+			openEdit('accessCode', '访问码（未开启访问码请留空）', accessCode.value)
+		} else if (index == 5) {
+			toggleProtocol()
+		} else if (index == 6) {
+			doLogin()
+		} else if (index == 7) {
+			doLogout()
+		}
+	}
+
+	/** 层「login.2fa」：两步验证弹窗（最上层覆盖，只认返回键，其余吞掉） */
+	function on2faKey(code: number): boolean {
+		if (code == KEY_BACK) {
+			show2fa.value = false
+		}
+		return true
+	}
+
+	/** 层「login.edit」：编辑弹窗（覆盖层，吞掉所有键） */
+	function onEditKey(code: number): boolean {
+		if (code == KEY_LEFT) {
+			editFocus.value = 0
+		} else if (code == KEY_RIGHT) {
+			editFocus.value = 1
+		} else if (code == KEY_OK || code == KEY_ENTER) {
+			if (editFocus.value == 0) {
+				confirmEdit()
+			} else {
+				cancelEdit()
+			}
+		} else if (code == KEY_BACK) {
+			cancelEdit()
+		}
+		return true
+	}
+
+	/** 取消「再按一次退出」的待确认状态（被 onExitKey / onFormKey 调用，必须定义在前面） */
+	function disarmExit(): void {
+		exitArmed.value = false
+		if (exitTimer != 0) {
+			clearTimeout(exitTimer)
+			exitTimer = 0
+		}
+	}
+
+	/**
+	 * 返回键（登录页是根页面，没有「上一页」）：
+	 * 第一次只提示「再按一次返回键退出应用」，2.5 秒内再按一次才真正退出。
+	 *
+	 * 返回键现在由 App 独占（Kotlin 侧不再转交系统，见 FnOsTvKeys），
+	 * 所以这里必须给出明确语义，否则用户在登录页按返回会「没反应」。
+	 */
+	function onExitKey(code: number): void {
+		if (exitArmed.value) {
+			disarmExit()
+			quitApp()
+			return
+		}
+		exitArmed.value = true
+		statusText.value = '再按一次返回键退出应用'
+		if (exitTimer != 0) {
+			clearTimeout(exitTimer)
+		}
+		exitTimer = setTimeout(() => {
+			exitArmed.value = false
+			exitTimer = 0
+			statusText.value = getToken().length > 0 ? '已登录' : '已就绪'
+		}, 2500)
+	}
+
+	/** 层「login.form」：连接表单（基础层，上下选行、OK 动作、返回二次确认退出） */
+	function onFormKey(code: number): boolean {
+		if (code == KEY_DOWN) {
+			focusIndex.value = (focusIndex.value + 1) % ROW_COUNT
+			disarmExit()
+		} else if (code == KEY_UP) {
+			focusIndex.value = (focusIndex.value + ROW_COUNT - 1) % ROW_COUNT
+			disarmExit()
+		} else if (code == KEY_OK || code == KEY_ENTER) {
+			disarmExit()
+			activate(focusIndex.value)
+		} else if (code == KEY_BACK) {
+			onExitKey(code)
+		} else {
+			return false
+		}
+		return true
+	}
+
+	/** 层名 → 处理函数（UTS 不能把函数放进容器，所以用名字查表） */
+	function runKeyLayer(layer: string, code: number): boolean {
+		if (layer == 'login.2fa') {
+			return on2faKey(code)
+		}
+		if (layer == 'login.edit') {
+			return onEditKey(code)
+		}
+		if (layer == 'login.form') {
+			return onFormKey(code)
+		}
+		return false
+	}
+
+	/**
+	 * 遥控器入口（T5 分发层）：表单在底，编辑弹窗 / 两步验证弹窗按打开顺序压在上面。
+	 * 两个弹窗都是模态：弹出后方向键不再跑到表单上。
+	 */
+	function handleKey(code: number) {
+		const stack: Array<string> = []
+		stack.push('login.form')
+		if (editing.value) {
+			stack.push('login.edit')
+		}
+		if (show2fa.value) {
+			stack.push('login.2fa')
+		}
+		dispatchKey(code, stack, (layer: string, c: number): boolean => {
+			return runKeyLayer(layer, c)
+		})
+	}
+
+	onLoad(() => {
+		const cfg = getSavedConfig()
+		if (cfg.saved) {
+			host.value = cfg.host
+			port.value = cfg.port.toString()
+			useHttps.value = cfg.https
+			username.value = cfg.username
+			password.value = cfg.password
+			accessCode.value = cfg.accessCode
+			statusText.value = getToken().length > 0 ? '已登录' : '已载入上次配置'
+		}
+		// 诊断串：自动登录相关的现场（只在自动登录这条路出问题时显示在底部）
+		diagText.value = 'cfg saved=' + (cfg.saved ? '1' : '0') +
+			' host=' + cfg.host + ' user=' + cfg.username +
+			' pwd=' + cfg.password.length.toString() + ' acc=' + cfg.accessCode.length.toString() +
+			' token=' + getToken().length.toString()
+		keyHook = startTvKeyHook((code: number) => {
+			handleKey(code)
+		})
+		// 已保存过账号且密码不为空：电视开机后直接自动登录，省去每次用遥控器输入。
+		// 从图库按返回键回到本页时会设置 skipAuto 标记，避免「设置页 → 自动登录 → 又回图库」的死循环。
+		let skipAuto = false
+		const skipFlag = uni.getStorageSync('fnos.skipAuto')
+		if (skipFlag != null) {
+			// Android 上 storage 读回来统一是字符串（存 true 会取回 "true"），直接 as boolean 会 ClassCastException
+			skipAuto = skipFlag.toString() == 'true'
+			uni.removeStorageSync('fnos.skipAuto')
+		}
+		if (!cfg.saved || cfg.password.length == 0) {
+			// 冷启动偶尔读不到保存的配置（存储/插件初始化时序）：400ms 后重读一次再决定
+			setTimeout(() => {
+				const again = getSavedConfig()
+				if (!again.saved) {
+					return
+				}
+				host.value = again.host
+				port.value = again.port.toString()
+				useHttps.value = again.https
+				username.value = again.username
+				password.value = again.password
+				accessCode.value = again.accessCode
+				diagText.value = 'cfg(retry) saved=1 user=' + again.username + ' pwd=' + again.password.length.toString()
+				if (allowAutoLogin()) {
+					autoBusy.value = true
+					doLogin()
+				}
+			}, 400)
+			return
+		}
+		if (!skipAuto) {
+			if (allowAutoLogin()) {
+				// 自动登录时盖一层遮罩：用户从首页因 401 被送回来时，不会看到登录表单闪一下
+				autoBusy.value = true
+				doLogin()
+			} else {
+				statusText.value = '自动登录已暂停'
+				// 带上真实原因：否则只知道「失败了」，不知道是密码错、还是服务端拒绝
+				errorText.value = lastAutoError.length > 0
+					? '自动登录连续失败：' + lastAutoError + '（请手动登录一次）'
+					: '自动登录连续失败，请检查账号密码后手动登录'
+			}
+		}
+	})
+
+	onUnload(() => {
+		disarmExit()
+		stopTvKeyHook(keyHook)
+	})
+</script>
+
+<style>
+	/* 与图库页统一的 tvOS 深灰底 */
+	.page {
+		flex: 1;
+		position: relative;
+		background-color: #141418;
+		padding: 16rpx;
+	}
+
+	/* ---------------- 自动登录遮罩 ---------------- */
+
+	.auto-mask {
+		position: absolute;
+		left: 0;
+		top: 0;
+		width: 100%;
+		height: 100%;
+		z-index: 99;
+		background-color: #141418;
+		align-items: center;
+		justify-content: center;
+	}
+
+	.auto-logo {
+		width: 88rpx;
+		height: 88rpx;
+		margin-bottom: 14rpx;
+	}
+
+	.auto-text {
+		font-size: 14rpx;
+		color: #8A8B8E;
+	}
+
+	/* ---------------- 顶部 ---------------- */
+
+	.header {
+		flex-direction: row;
+		align-items: center;
+		justify-content: space-between;
+		/* 不给固定高度：标题 26rpx + 副标题 13rpx + 间距 4rpx = 43rpx，
+		   logo 48rpx，写死 40rpx 会把副标题裁掉 */
+		margin-bottom: 12rpx;
+	}
+
+	.brand {
+		flex-direction: row;
+		align-items: center;
+	}
+
+	/* 官方 logo（方形，自带圆角与白描边），不要再加底色/圆角，否则会露出蓝方块 */
+	.logo {
+		width: 52rpx;
+		height: 52rpx;
+		margin-right: 14rpx;
+	}
+
+	.titles {
+		flex-direction: column;
+	}
+
+	.title {
+		font-size: 26rpx;
+		font-weight: bold;
+		color: #FFFFFF;
+	}
+
+	.subtitle {
+		font-size: 13rpx;
+		color: #9F9FA1;
+		margin-top: 4rpx;
+	}
+
+	.chip {
+		padding: 8rpx 18rpx;
+		border-radius: 20rpx;
+		border-width: 2rpx;
+		border-style: solid;
+	}
+
+	.chip-on {
+		background-color: #132B4D;
+		border-color: #3388FF;
+	}
+
+	.chip-off {
+		background-color: #1E1E21;
+		border-color: #303030;
+	}
+
+	.chip-text {
+		font-size: 14rpx;
+		color: #C2C3C4;
+	}
+
+	/* ---------------- 主体 ---------------- */
+
+	.content {
+		flex: 1;
+		flex-direction: row;
+	}
+
+	.panel {
+		flex: 1.25;
+		background-color: #202024;
+		border-radius: 14rpx;
+		border-width: 2rpx;
+		border-style: solid;
+		border-color: #303030;
+		padding: 12rpx;
+		margin-right: 12rpx;
+	}
+
+	.side {
+		flex: 1;
+		margin-right: 0;
+	}
+
+	.panel-title {
+		font-size: 14rpx;
+		color: #9F9FA1;
+		margin-bottom: 8rpx;
+	}
+
+	/* ---------------- 配置行 ---------------- */
+
+	.row {
+		height: 22rpx;
+		flex-direction: row;
+		align-items: center;
+		justify-content: space-between;
+		padding-left: 14rpx;
+		padding-right: 14rpx;
+		margin-bottom: 4rpx;
+		border-radius: 8rpx;
+		border-width: 2rpx;
+		border-style: solid;
+		border-color: #1E1E21;
+		background-color: #1E1E21;
+	}
+
+	.row-focus {
+		background-color: #132B4D;
+		border-color: #3388FF;
+	}
+
+	.row-label {
+		font-size: 15rpx;
+		color: #9F9FA1;
+	}
+
+	.row-value {
+		font-size: 15rpx;
+		color: #FFFFFF;
+	}
+
+	/* ---------------- 操作按钮 ---------------- */
+
+	.action {
+		height: 22rpx;
+		align-items: center;
+		justify-content: center;
+		border-radius: 8rpx;
+		border-width: 2rpx;
+		border-style: solid;
+		border-color: #303030;
+		background-color: #2A2A2E;
+		margin-bottom: 4rpx;
+	}
+
+	.action-focus {
+		background-color: #3388FF;
+		border-color: #3388FF;
+	}
+
+	.action-text {
+		font-size: 15rpx;
+		color: #E6E6E7;
+	}
+
+	/* ---------------- 状态 ---------------- */
+
+	.kv {
+		flex-direction: column;
+		margin-bottom: 12rpx;
+	}
+
+	.kv-key {
+		font-size: 13rpx;
+		color: #7C7D7F;
+		margin-bottom: 2rpx;
+	}
+
+	.kv-val {
+		font-size: 15rpx;
+		color: #FFFFFF;
+	}
+
+	.error-box {
+		background-color: #2A1A17;
+		border-width: 2rpx;
+		border-style: solid;
+		border-color: #E26052;
+		border-radius: 10rpx;
+		padding: 10rpx 12rpx;
+		margin-top: 6rpx;
+	}
+
+	.error-text {
+		font-size: 13rpx;
+		color: #E26052;
+	}
+
+	.hint {
+		margin-top: 10rpx;
+		padding: 10rpx 12rpx;
+		border-radius: 10rpx;
+		background-color: #17171A;
+	}
+
+	.hint-text {
+		font-size: 12rpx;
+		color: #7C7D7F;
+		line-height: 20rpx;
+	}
+
+	/* ---------------- 底部 ---------------- */
+
+	.footer {
+		height: 18rpx;
+		justify-content: center;
+		align-items: center;
+	}
+
+	.footer-text {
+		font-size: 12rpx;
+		color: #5A5B5C;
+	}
+
+	/* 自动登录诊断串：很小的一行，不影响操作 */
+	.diag {
+		height: 14rpx;
+		justify-content: center;
+		align-items: center;
+	}
+
+	.diag-text {
+		font-size: 9rpx;
+		color: #4A4C56;
+	}
+
+	/* ---------------- 弹窗 ---------------- */
+
+	.overlay {
+		position: absolute;
+		left: 0;
+		top: 0;
+		right: 0;
+		bottom: 0;
+		background-color: rgba(0, 0, 0, 0.72);
+		align-items: center;
+		justify-content: center;
+	}
+
+	.dialog {
+		width: 520rpx;
+		background-color: #1E1E21;
+		border-radius: 18rpx;
+		border-width: 2rpx;
+		border-style: solid;
+		border-color: #303030;
+		padding: 24rpx;
+	}
+
+	.dialog-label {
+		font-size: 18rpx;
+		font-weight: bold;
+		color: #FFFFFF;
+		margin-bottom: 6rpx;
+	}
+
+	.dialog-desc {
+		font-size: 13rpx;
+		color: #9F9FA1;
+		margin-bottom: 10rpx;
+	}
+
+	.dialog-input {
+		height: 40rpx;
+		background-color: #17171A;
+		border-radius: 10rpx;
+		border-width: 2rpx;
+		border-style: solid;
+		border-color: #3388FF;
+		padding-left: 12rpx;
+		padding-right: 12rpx;
+		color: #FFFFFF;
+		font-size: 16rpx;
+		margin-bottom: 14rpx;
+	}
+
+	.dialog-actions {
+		flex-direction: row;
+	}
+
+	.dialog-btn {
+		flex: 1;
+		height: 32rpx;
+		align-items: center;
+		justify-content: center;
+		border-radius: 10rpx;
+		border-width: 2rpx;
+		border-style: solid;
+		border-color: #303030;
+		background-color: #2A2A2E;
+		margin-right: 10rpx;
+	}
+
+	.dialog-btn-on {
+		background-color: #3388FF;
+		border-color: #3388FF;
+	}
+
+	.dialog-btn-text {
+		font-size: 15rpx;
+		color: #E6E6E7;
+	}
+
+	.dialog-tip {
+		font-size: 11rpx;
+		color: #5A5B5C;
+		margin-top: 10rpx;
+	}
+</style>

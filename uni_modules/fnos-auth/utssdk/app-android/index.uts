@@ -1,0 +1,660 @@
+import {
+  FnOsLoginResult,
+  FnOsStatResult,
+  FnOsSavedConfig,
+  FnOsTimeline,
+  FnOsYear,
+  FnOsMonth,
+  FnOsPhoto,
+  FnOsPhotoPage,
+  FnOsPhotoDetail,
+  FnOsSearchResult,
+  FnOsAlbum,
+  FnOsAlbumPage,
+  FnOsAlbumDetail,
+  FnOsAlbumBrief,
+  FnOsPersonBrief,
+  FnOsUserInfo,
+  FnOsSmartCategory,
+  FnOsSmartCategoryPage,
+  FnOsVideoQuality,
+  FnOsVideoInfo,
+  FnOsVideoPlay
+} from '../interface.uts'
+import { FnOsLogin, FnOsTvKeys } from 'uts.sdk.modules.fnosAuth'
+
+/**
+ * fnos-auth（Android TV / uni-app x）
+ *
+ * Kotlin 侧统一回传 JSON 字符串，这里解析成结构化对象。
+ * 所有函数都保证回调在主线程，可直接改 uvue 的响应式状态。
+ */
+
+function parse(text: string): UTSJSONObject {
+  const obj = JSON.parseObject(text)
+  if (obj != null) {
+    return obj
+  }
+  // 理论上不会走到这里：Kotlin 侧始终回传合法 JSON
+  return JSON.parseObject('{}')!
+}
+
+function toLoginResult(text: string): FnOsLoginResult {
+  const o = parse(text)
+  return {
+    ok: o.getBoolean('ok') ?? false,
+    need2fa: o.getBoolean('need2fa') ?? false,
+    token: o.getString('token') ?? '',
+    secret: o.getString('secret') ?? '',
+    error: o.getString('error') ?? ''
+  } as FnOsLoginResult
+}
+
+function toStatResult(text: string): FnOsStatResult {
+  const o = parse(text)
+  return {
+    ok: o.getBoolean('ok') ?? false,
+    need2fa: o.getBoolean('need2fa') ?? false,
+    photoCount: o.getNumber('photoCount') ?? 0,
+    videoCount: o.getNumber('videoCount') ?? 0,
+    error: o.getString('error') ?? ''
+  } as FnOsStatResult
+}
+
+/**
+ * 登录并获取 AccessToken。
+ *
+ * 内部流程（与 fnOS Web 端一致）：
+ *   /access_code_verify（可选） → WS util.crypto.getRSAPub
+ *   → user.login（AES+RSA 加密信封）→ token
+ *
+ * @param host     NAS 地址，可带 http(s):// 前缀，端口单独传
+ * @param port     飞牛 Web 端口：HTTP 默认 5666，HTTPS 默认 5667
+ * @param useHttps true 走 HTTPS/WSS（自签证书 + TOFU 指纹），false 走纯 HTTP/WS
+ */
+export function login(
+  host: string,
+  port: number,
+  useHttps: boolean,
+  username: string,
+  password: string,
+  accessCode: string
+): Promise<FnOsLoginResult> {
+  return new Promise<FnOsLoginResult>((resolve, _reject) => {
+    FnOsLogin.login(host, port, useHttps, username, password, accessCode, (text: string) => {
+      resolve(toLoginResult(text))
+    })
+  })
+}
+
+/**
+ * 提交两步验证动态码。必须在 login() 返回 need2fa=true 之后调用，
+ * 且不能在此期间发起别的登录（服务端的临时凭证绑定在那条连接上）。
+ */
+export function verifyTwoFactor(code: string): Promise<FnOsLoginResult> {
+  return new Promise<FnOsLoginResult>((resolve, _reject) => {
+    FnOsLogin.verifyTwoFactor(code, (text: string) => {
+      resolve(toLoginResult(text))
+    })
+  })
+}
+
+/**
+ * 用当前 token 请求 /p/api/v1/user_photo/stat：
+ * 验证是否真的拿到可用的 AccessToken（含 authx 签名）。token 失效会自动重登一次。
+ */
+export function stat(): Promise<FnOsStatResult> {
+  return new Promise<FnOsStatResult>((resolve, _reject) => {
+    FnOsLogin.stat((text: string) => {
+      resolve(toStatResult(text))
+    })
+  })
+}
+
+/**
+ * 图库时间轴：服务端按天聚合，这里返回「年份 + 该年起始下标 + 总数」，
+ * 右侧年份导航直接用它跳页。
+ */
+export function timeline(): Promise<FnOsTimeline> {
+  return new Promise<FnOsTimeline>((resolve, _reject) => {
+    FnOsLogin.timeline((text: string) => {
+      const o = parse(text)
+      const years: Array<FnOsYear> = []
+      const arr = o.getArray('years')
+      if (arr != null) {
+        for (let i = 0; i < arr.length; i++) {
+          const y = arr[i] as UTSJSONObject
+          years.push({
+            year: y.getNumber('year') ?? 0,
+            offset: y.getNumber('offset') ?? 0
+          } as FnOsYear)
+        }
+      }
+      const months: Array<FnOsMonth> = []
+      const marr = o.getArray('months')
+      if (marr != null) {
+        for (let i = 0; i < marr.length; i++) {
+          const m = marr[i] as UTSJSONObject
+          months.push({
+            year: m.getNumber('year') ?? 0,
+            month: m.getNumber('month') ?? 0,
+            offset: m.getNumber('offset') ?? 0
+          } as FnOsMonth)
+        }
+      }
+      resolve({
+        ok: o.getBoolean('ok') ?? false,
+        total: o.getNumber('total') ?? 0,
+        years: years,
+        months: months,
+        error: o.getString('error') ?? ''
+      } as FnOsTimeline)
+    })
+  })
+}
+
+/** 按 offset/limit 拉一页图库（时间倒序） */
+export function page(offset: number, limit: number): Promise<FnOsPhotoPage> {
+  return new Promise<FnOsPhotoPage>((resolve, _reject) => {
+    FnOsLogin.page(offset, limit, (text: string) => {
+      const o = parse(text)
+      const items: Array<FnOsPhoto> = []
+      const arr = o.getArray('items')
+      if (arr != null) {
+        for (let i = 0; i < arr.length; i++) {
+          const it = arr[i] as UTSJSONObject
+          items.push({
+            id: it.getString('id') ?? '',
+            dt: it.getString('dt') ?? '',
+            cat: it.getString('cat') ?? '',
+            w: it.getNumber('w') ?? 0,
+            h: it.getNumber('h') ?? 0,
+            live: it.getBoolean('live') ?? false,
+            thumb: it.getString('thumb') ?? '',
+            medium: it.getString('medium') ?? '',
+            original: it.getString('original') ?? '',
+            name: it.getString('name') ?? '',
+            video: it.getString('video') ?? '',
+            duration: it.getNumber('duration') ?? 0
+          } as FnOsPhoto)
+        }
+      }
+      resolve({
+        ok: o.getBoolean('ok') ?? false,
+        items: items,
+        error: o.getString('error') ?? ''
+      } as FnOsPhotoPage)
+    })
+  })
+}
+
+/**
+ * AI 搜索：`POST /p/api/v1/magic-search/do`（请求体 `{"keyword":"海边","antiFilters":[]}`）。
+ *
+ * 返回项与图库同构，网格 / 角标 / 查看器可以直接复用 `common/photo.uts` 那一套。
+ * 关键字为空时不发请求，直接回空列表。
+ */
+export function search(keyword: string): Promise<FnOsSearchResult> {
+  return new Promise<FnOsSearchResult>((resolve, _reject) => {
+    FnOsLogin.search(keyword, (text: string) => {
+      const o = parse(text)
+      const items: Array<FnOsPhoto> = []
+      const arr = o.getArray('items')
+      if (arr != null) {
+        for (let i = 0; i < arr.length; i++) {
+          const it = arr[i] as UTSJSONObject
+          items.push({
+            id: it.getString('id') ?? '',
+            dt: it.getString('dt') ?? '',
+            cat: it.getString('cat') ?? '',
+            w: it.getNumber('w') ?? 0,
+            h: it.getNumber('h') ?? 0,
+            live: it.getBoolean('live') ?? false,
+            thumb: it.getString('thumb') ?? '',
+            medium: it.getString('medium') ?? '',
+            original: it.getString('original') ?? '',
+            name: it.getString('name') ?? '',
+            video: it.getString('video') ?? '',
+            duration: it.getNumber('duration') ?? 0
+          } as FnOsPhoto)
+        }
+      }
+      resolve({
+        ok: o.getBoolean('ok') ?? false,
+        items: items,
+        total: o.getNumber('total') ?? items.length,
+        error: o.getString('error') ?? ''
+      } as FnOsSearchResult)
+    })
+  })
+}
+
+/**
+ * 相册列表（`album/list`，按相册名倒序）。
+ *
+ * 相册页一次拉全量（本机实测一百多个相册，limit=1000 足够），
+ * 数据量小到不值得做分页；真要分页时把 offset 传进来即可。
+ */
+export function albums(offset: number, limit: number): Promise<FnOsAlbumPage> {
+  return new Promise<FnOsAlbumPage>((resolve, _reject) => {
+    FnOsLogin.albums(offset, limit, (text: string) => {
+      const o = parse(text)
+      const items: Array<FnOsAlbum> = []
+      const arr = o.getArray('items')
+      if (arr != null) {
+        for (let i = 0; i < arr.length; i++) {
+          const a = arr[i] as UTSJSONObject
+          items.push({
+            id: a.getNumber('id') ?? 0,
+            name: a.getString('name') ?? '',
+            count: a.getNumber('count') ?? 0,
+            shared: a.getBoolean('shared') ?? false,
+            cover: a.getString('cover') ?? '',
+            category: a.getNumber('category') ?? 0,
+            month: a.getString('month') ?? '',
+            start: a.getString('start') ?? ''
+          } as FnOsAlbum)
+        }
+      }
+      resolve({
+        ok: o.getBoolean('ok') ?? false,
+        items: items,
+        total: o.getNumber('total') ?? items.length,
+        error: o.getString('error') ?? ''
+      } as FnOsAlbumPage)
+    })
+  })
+}
+
+/** 相册详情（`album/item`）：相册内页的头部信息 */
+export function albumDetail(id: number): Promise<FnOsAlbumDetail> {
+  return new Promise<FnOsAlbumDetail>((resolve, _reject) => {
+    FnOsLogin.albumDetail(id, (text: string) => {
+      const o = parse(text)
+      resolve({
+        ok: o.getBoolean('ok') ?? false,
+        error: o.getString('error') ?? '',
+        id: o.getNumber('id') ?? 0,
+        name: o.getString('name') ?? '',
+        photoCount: o.getNumber('photoCount') ?? 0,
+        videoCount: o.getNumber('videoCount') ?? 0,
+        cover: o.getString('cover') ?? '',
+        start: o.getString('start') ?? '',
+        end: o.getString('end') ?? '',
+        shared: o.getBoolean('shared') ?? false,
+        owner: o.getString('owner') ?? ''
+      } as FnOsAlbumDetail)
+    })
+  })
+}
+
+/**
+ * 相册内照片（`album/normal/getList`）：按 offset/limit 分页，
+ * `ascending=true` 时按拍摄时间正序（页面的「拍摄时间 ↑」）。
+ */
+export function albumPhotos(
+  albumId: number,
+  offset: number,
+  limit: number,
+  ascending: boolean
+): Promise<FnOsPhotoPage> {
+  return new Promise<FnOsPhotoPage>((resolve, _reject) => {
+    FnOsLogin.albumPhotos(albumId, offset, limit, ascending, (text: string) => {
+      const o = parse(text)
+      const items: Array<FnOsPhoto> = []
+      const arr = o.getArray('items')
+      if (arr != null) {
+        for (let i = 0; i < arr.length; i++) {
+          const it = arr[i] as UTSJSONObject
+          items.push({
+            id: it.getString('id') ?? '',
+            dt: it.getString('dt') ?? '',
+            cat: it.getString('cat') ?? '',
+            w: it.getNumber('w') ?? 0,
+            h: it.getNumber('h') ?? 0,
+            live: it.getBoolean('live') ?? false,
+            thumb: it.getString('thumb') ?? '',
+            medium: it.getString('medium') ?? '',
+            original: it.getString('original') ?? '',
+            name: it.getString('name') ?? '',
+            video: it.getString('video') ?? '',
+            duration: it.getNumber('duration') ?? 0
+          } as FnOsPhoto)
+        }
+      }
+      resolve({
+        ok: o.getBoolean('ok') ?? false,
+        items: items,
+        error: o.getString('error') ?? ''
+      } as FnOsPhotoPage)
+    })
+  })
+}
+
+/**
+ * 当前登录用户（`user/info`）：设置页用它验证 token 是否仍然有效。
+ * 未登录 / token 失效时 `ok=false`，`error` 带原因。
+ */
+export function userInfo(): Promise<FnOsUserInfo> {
+  return new Promise<FnOsUserInfo>((resolve, _reject) => {
+    FnOsLogin.userInfo((text: string) => {
+      const o = parse(text)
+      resolve({
+        ok: o.getBoolean('ok') ?? false,
+        name: o.getString('name') ?? '',
+        isAdmin: o.getBoolean('isAdmin') ?? false,
+        id: o.getNumber('id') ?? 0,
+        error: o.getString('error') ?? ''
+      } as FnOsUserInfo)
+    })
+  })
+}
+
+/**
+ * 智能场景分类（`ai-smart-rec/categories?mainCategory=scene`）。
+ *
+ * 首页大屏的数据源：`count` 是该场景的照片 + 视频数，`cover` 是 m 尺寸海报路径
+ * （全屏背景，需 `image()` 下载到本地），`thumb` 是 s 尺寸卡片封面（`thumb()`）。
+ */
+export function smartCategories(): Promise<FnOsSmartCategoryPage> {
+  return new Promise<FnOsSmartCategoryPage>((resolve, _reject) => {
+    FnOsLogin.smartCategories((text: string) => {
+      const o = parse(text)
+      const items: Array<FnOsSmartCategory> = []
+      const arr = o.getArray('items')
+      if (arr != null) {
+        for (let i = 0; i < arr.length; i++) {
+          const it = arr[i] as UTSJSONObject
+          items.push({
+            name: it.getString('name') ?? '',
+            count: it.getNumber('count') ?? 0,
+            cover: it.getString('cover') ?? '',
+            thumb: it.getString('thumb') ?? ''
+          } as FnOsSmartCategory)
+        }
+      }
+      resolve({
+        ok: o.getBoolean('ok') ?? false,
+        items: items,
+        error: o.getString('error') ?? ''
+      } as FnOsSmartCategoryPage)
+    })
+  })
+}
+
+/**
+ * 下载缩略图到本地缓存，返回可直接给 <image> 用的绝对路径。
+ *
+ * fnOS 的图片流只认 AccessToken 请求头（query 传 token 会 401），
+ * 而 uvue 的 image 组件无法加请求头，所以必须由原生侧下载。
+ * 已下载过的图片会直接命中磁盘缓存（同一进程内也不会重复请求）。
+ */
+export function thumb(path: string): Promise<string> {
+  return new Promise<string>((resolve, _reject) => {
+    FnOsLogin.thumb(path, (text: string) => {
+      const o = parse(text)
+      resolve(o.getString('path') ?? '')
+    })
+  })
+}
+
+/**
+ * 通用图片下载（查看器用）：与 thumb 同一套鉴权、磁盘缓存与线程池，
+ * 区别只是缓存文件名带原图扩展名（原图可能是 png/heic，写死 .jpg 有风险）。
+ * 同一个 path 第二次调用直接命中缓存。
+ */
+export function image(path: string): Promise<string> {
+  return new Promise<string>((resolve, _reject) => {
+    FnOsLogin.image(path, (text: string) => {
+      const o = parse(text)
+      resolve(o.getString('path') ?? '')
+    })
+  })
+}
+
+/**
+ * 视频 / 实况片段下载：与 image 同一套鉴权、磁盘缓存与线程池，
+ * 返回本地绝对路径，直接给 <video> 的 src 用（video 组件加不了请求头）。
+ * 同一个 path 第二次调用直接命中缓存。
+ */
+export function video(path: string): Promise<string> {
+  return new Promise<string>((resolve, _reject) => {
+    FnOsLogin.video(path, (text: string) => {
+      const o = parse(text)
+      resolve(o.getString('path') ?? '')
+    })
+  })
+}
+
+/**
+ * 视频流的绝对地址（**不带鉴权**）。
+ *
+ * ⚠️ 直接把它交给 `<video src>` 会 401：`<video :header>` 在 uni-app x 真机上并没有把
+ * header 交给 ExoPlayer（实测 `InvalidResponseCodeException: 401`，直链与 HLS 都是）。
+ * 播放入口请用 [mediaUrl]（本机回环代理，由插件自己补 `AccessToken`）。
+ */
+export function streamUrl(path: string): string {
+  return FnOsLogin.remoteUrl(path)
+}
+
+/**
+ * 播放地址（`<video src>` 用）：App 端返回 `http://127.0.0.1:<port>/v/<base64url>`，
+ * 由插件内的本机代理代取字节（带 `AccessToken`、透传 `Range`，HLS 还会重写 m3u8 分片行）。
+ */
+export function mediaUrl(path: string): string {
+  return FnOsLogin.mediaUrl(path)
+}
+
+/**
+ * `<video>` 的请求头：当前 token。拿不到（没登录）时返回 null。
+ *
+ * **实测在 uni-app x 真机上无效**（401，见 AGENTS 5.19），保留只为兼容 / 诊断；
+ * 真正让视频能播的是 [mediaUrl] 的本机代理。
+ */
+export function videoHeader(): UTSJSONObject | null {
+  const token = FnOsLogin.getToken()
+  if (token.length == 0) {
+    return null
+  }
+  return JSON.parseObject('{"AccessToken":"' + token + '"}')
+}
+
+/** 视频清晰度列表（`video/decode/info`）；失败时 qualities 为空、error 有值 */
+export function videoInfo(id: string): Promise<FnOsVideoInfo> {
+  return new Promise<FnOsVideoInfo>((resolve, _reject) => {
+    FnOsLogin.videoInfo(id, (text: string) => {
+      const o = parse(text)
+      const list = o.getArray('qualities')
+      const items: Array<FnOsVideoQuality> = []
+      if (list != null) {
+        for (let i = 0; i < list.length; i++) {
+          const q = list[i] as UTSJSONObject
+          items.push({
+            resolution: q.getString('resolution') ?? '',
+            bitrate: q.getNumber('bitrate') ?? 0,
+            progressive: q.getBoolean('progressive') ?? false
+          } as FnOsVideoQuality)
+        }
+      }
+      const error = o.getString('error') ?? ''
+      resolve({
+        ok: error.length == 0 && items.length > 0,
+        error: error,
+        qualities: items,
+        sourceWidth: o.getNumber('sourceWidth') ?? 0,
+        sourceHeight: o.getNumber('sourceHeight') ?? 0,
+        rotation: o.getNumber('rotation') ?? 0
+      } as FnOsVideoInfo)
+    })
+  })
+}
+
+/**
+ * 申请一路转码流（`video/decode/play`），返回可直接播放的相对路径。
+ *
+ * `startPosition`（秒）：从该进度开始转码，T4.8 的 HEVC 兜底用来续播；填 0 表示从头。
+ * Kotlin 侧只在 > 0 时才把这个字段放进请求体（未确认的字段，别影响原有的三档链路）。
+ */
+export function videoPlay(id: string, bitrate: number, resolution: string, startPosition: number): Promise<FnOsVideoPlay> {
+  return new Promise<FnOsVideoPlay>((resolve, _reject) => {
+    FnOsLogin.videoPlay(id, bitrate, resolution, startPosition, (text: string) => {
+      const o = parse(text)
+      const path = o.getString('path') ?? ''
+      const error = o.getString('error') ?? ''
+      resolve({
+        ok: path.length > 0,
+        path: path,
+        error: error
+      } as FnOsVideoPlay)
+    })
+  })
+}
+
+/**
+ * 照片详情（`gallery/getOne`）：文件大小、相机、曝光参数、路径、GPS。
+ * 查看器详情面板用；`page()` 不返回这些字段。
+ */
+export function photoDetail(id: string): Promise<FnOsPhotoDetail> {
+  return new Promise<FnOsPhotoDetail>((resolve, _reject) => {
+    FnOsLogin.detail(id, (text: string) => {
+      const o = parse(text)
+      const albums: Array<FnOsAlbumBrief> = []
+      const aarr = o.getArray('albums')
+      if (aarr != null) {
+        for (let i = 0; i < aarr.length; i++) {
+          const a = aarr[i] as UTSJSONObject
+          albums.push({
+            name: a.getString('name') ?? '',
+            month: a.getString('month') ?? '',
+            count: a.getNumber('count') ?? 0,
+            shared: a.getBoolean('shared') ?? false,
+            cover: a.getString('cover') ?? ''
+          } as FnOsAlbumBrief)
+        }
+      }
+      const persons: Array<FnOsPersonBrief> = []
+      const parr = o.getArray('persons')
+      if (parr != null) {
+        for (let i = 0; i < parr.length; i++) {
+          const person = parr[i] as UTSJSONObject
+          persons.push({
+            name: person.getString('name') ?? '',
+            avatar: person.getString('avatar') ?? ''
+          } as FnOsPersonBrief)
+        }
+      }
+      resolve({
+        ok: o.getBoolean('ok') ?? false,
+        error: o.getString('error') ?? '',
+        fileName: o.getString('fileName') ?? '',
+        filePath: o.getString('filePath') ?? '',
+        fileSize: o.getString('fileSize') ?? '',
+        mp: o.getString('mp') ?? '',
+        width: o.getNumber('width') ?? 0,
+        height: o.getNumber('height') ?? 0,
+        dateTime: o.getString('dateTime') ?? '',
+        camera: o.getString('camera') ?? '',
+        aperture: o.getString('aperture') ?? '',
+        exposure: o.getString('exposure') ?? '',
+        iso: o.getString('iso') ?? '',
+        focal: o.getString('focal') ?? '',
+        geo: o.getString('geo') ?? '',
+        latitude: o.getNumber('latitude') ?? 0,
+        longitude: o.getNumber('longitude') ?? 0,
+        albums: albums,
+        persons: persons,
+        description: o.getString('description') ?? ''
+      } as FnOsPhotoDetail)
+    })
+  })
+}
+
+/** 当前内存里的 token（重新登录或退出会清空） */
+export function getToken(): string {
+  return FnOsLogin.getToken()
+}
+
+/** 退出并清空 token、cookie 与挂起中的两步验证会话 */
+export function logout(): void {
+  FnOsLogin.logout()
+}
+
+/** 保存连接配置（地址/端口/协议/账号/密码/访问码），用于冷启动自动重登 */
+export function saveConfig(
+  host: string,
+  port: number,
+  useHttps: boolean,
+  username: string,
+  password: string,
+  accessCode: string
+): void {
+  FnOsLogin.saveConfig(host, port, useHttps, username, password, accessCode)
+}
+
+/** 读取本地保存的连接配置 */
+export function getSavedConfig(): FnOsSavedConfig {
+  const o = parse(FnOsLogin.loadConfig())
+  return {
+    saved: o.getBoolean('saved') ?? false,
+    host: o.getString('host') ?? '',
+    port: o.getNumber('port') ?? 5667,
+    https: o.getBoolean('https') ?? false,
+    username: o.getString('username') ?? '',
+    password: o.getString('password') ?? '',
+    accessCode: o.getString('accessCode') ?? ''
+  } as FnOsSavedConfig
+}
+
+/**
+ * 开启遥控器按键上报，返回本次订阅的 id（退订时原样传给 stopTvKeyHook）。
+ *
+ * 回调在主线程，参数是 Android KeyEvent.keyCode：
+ *   19 上 / 20 下 / 21 左 / 22 右 / 23 OK / 66 回车 / 4 返回
+ *
+ * 注意：uni.reLaunch 时新旧页面的 onLoad / onUnload 顺序不保证，
+ * 所以退订必须带 id —— 否则旧页面的 onUnload 会把新页面刚装好的通道关掉
+ * （真机现象：登录页遥控器正常，进图库后所有按键失效）。
+ */
+/**
+ * 订阅 id 的自增计数器。
+ *
+ * ⚠️ 以前是 `Date.now()`（毫秒时间戳）：`onLoad` 和 `onShow` 往往在**同一毫秒**内各调一次
+ * `startTvKeyHook`，两个 id 完全相同；再叠加「上一页 `stop(id)` 恰好也在同一毫秒」，
+ * 就会出现**旧页面的退订把新页面的通道清掉**——真机表现为「某个页面按键完全没反应」（2026-11-23 实测）。
+ * 自增计数器保证 id 永不重复。
+ */
+let tvKeySeq = 0
+
+export function startTvKeyHook(callback: (code: number) => void): number {
+  tvKeySeq = tvKeySeq + 1
+  const id = tvKeySeq
+  FnOsTvKeys.start(id, (code: number) => {
+    callback(code)
+  })
+  return id
+}
+
+/** 关闭按键上报：只有当前持有者（id 相同）能关，过期的 stop 会被忽略 */
+export function stopTvKeyHook(id: number): void {
+  FnOsTvKeys.stop(id)
+}
+
+/**
+ * 退出应用（首页 / 登录页的「退出」确认后调用）。
+ *
+ * 原生侧 finishAffinity 关掉整个任务、回到电视桌面；
+ * 拿不到 Activity 时静默忽略（不影响页面继续使用）。
+ */
+export function quitApp(): void {
+  FnOsLogin.quitApp()
+}
+
+/**
+ * 诊断日志：写进 logcat（tag `FnOsApp`）。
+ *
+ * release 包里 UTS 的 `console.log` 会被编译期剥掉，真机排查（尤其「黑屏不播」这种
+ * 没有界面反馈的问题）只能靠 Kotlin 侧的 Log。浏览器端退化成 console.log。
+ */
+export function appLog(msg: string): void {
+  FnOsLogin.log(msg)
+}

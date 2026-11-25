@@ -1,0 +1,96 @@
+<template>
+	<!-- 带「窗口」的缩略图：只有 `active` 为真时才下载并持有位图。
+	     用来解决「相册内页 / 搜索页翻久了内存一路涨、越来越卡」的问题
+	     （真机实测：翻 60 行、约 360 张已挂载 → Native Heap 87MB → 221MB，
+	     每张缩略图约 360KB 常驻；2400 张要 ~880MB，系统必然回收位图）。 -->
+	<view class="lt">
+		<image v-if="src.length > 0" class="lt-img" :src="src" mode="aspectFill" @error="onError" />
+		<view v-else class="lt-ph"></view>
+	</view>
+</template>
+
+<script setup lang="uts">
+	import { thumb } from '@/uni_modules/fnos-auth'
+
+	const props = defineProps<{
+		/** 缩略图在 NAS 上的路径（`photo.thumb`） */
+		path: string
+		/** 是否在渲染窗口内：false 时清掉位图，为真时再按需加载 */
+		active: boolean
+	}>()
+
+	const src = ref('')
+	const triedFileUri = ref(false)
+	/** 防止重复触发（同一张在 active 反复翻转时不要排队下载） */
+	let loading = false
+
+	function clear() {
+		src.value = ''
+		triedFileUri.value = false
+	}
+
+	function load() {
+		const p: string = props.path
+		if (p.length == 0 || src.value.length > 0 || loading) {
+			return
+		}
+		loading = true
+		thumb(p).then((local: string) => {
+			loading = false
+			// 下载期间可能已经被移出窗口：不要在窗口外把位图又挂回去
+			if (local.length > 0 && props.active) {
+				src.value = local
+			}
+		})
+	}
+
+	/** 个别 ROM 上 <image> 只认 file:// URI，加载失败时补一次前缀重试 */
+	function onError() {
+		// #ifdef APP-ANDROID
+		if (!triedFileUri.value && src.value.length > 0) {
+			triedFileUri.value = true
+			src.value = 'file://' + src.value
+		}
+		// #endif
+	}
+
+	onMounted(() => {
+		if (props.active) {
+			load()
+		}
+	})
+
+	watch((): boolean => props.active, (active: boolean, _prev: boolean) => {
+		if (active) {
+			load()
+		} else {
+			clear()
+		}
+	})
+
+	// 换片（同一个格子换了另一张）：先把旧位图丢掉，再按新路径加载
+	watch((): string => props.path, (_p: string, _prev: string) => {
+		clear()
+		if (props.active) {
+			load()
+		}
+	})
+</script>
+
+<style>
+	.lt {
+		width: 100%;
+		height: 100%;
+		background-color: #1E1E21;
+	}
+
+	/* <image> 默认 320x240，不显式给宽高会溢出 */
+	.lt-img {
+		width: 100%;
+		height: 100%;
+	}
+
+	.lt-ph {
+		flex: 1;
+	}
+</style>

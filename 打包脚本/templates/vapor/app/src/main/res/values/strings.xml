@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 应用名称：由「打包.ps1」按 manifest.json 的 name 自动写入，也可以直接改这里 -->
+    <string name="app_name">uni-app x</string>
+</resources>

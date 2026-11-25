@@ -1,0 +1,58 @@
+/**
+ * 图库 / 相册共用的照片项类型与展示文案。
+ *
+ * 两个列表接口（`gallery/getList`、`album/photos`）返回项同构，插件已把它们
+ * 解析成同一套字段，所以页面、网格、查看器组件都用这一份类型，不再各写一个 Photo。
+ */
+export type PhotoItem = {
+  id: string
+  /** "2026:11:02 17:27:09" */
+  dt: string
+  /** photo / video */
+  cat: string
+  w: number
+  h: number
+  /** 实况照片：网格角标用 */
+  live: boolean
+  thumb: string
+  medium: string
+  original: string
+  name: string
+  /** 实况片段 / 视频流地址 */
+  video: string
+  /** 视频时长（秒），照片恒为 0；网格角标显示用 */
+  duration: number
+}
+
+/** 秒 → m:ss / h:mm:ss（视频常过 1 小时，用 3 段而不是 90:00） */
+export function durationClock(sec: number): string {
+  let total = Math.floor(sec)
+  if (total < 0) {
+    total = 0
+  }
+  const s = total % 60
+  const m = Math.floor(total / 60) % 60
+  const h = Math.floor(total / 3600)
+  const ss = s < 10 ? '0' + s.toString() : s.toString()
+  if (h > 0) {
+    const mm = m < 10 ? '0' + m.toString() : m.toString()
+    return h.toString() + ':' + mm + ':' + ss
+  }
+  return m.toString() + ':' + ss
+}
+
+/**
+ * 视频角标文案：`视频 01:12`。
+ * 时长来自 `mediaDuration`（秒），照片或服务端没给时是 0 → 只显示「视频」。
+ */
+export function videoTagText(p: PhotoItem): string {
+  if (p.duration <= 0.0) {
+    return '视频'
+  }
+  return '视频 ' + durationClock(p.duration)
+}
+
+/** 实况角标：视频优先显示「视频」，只有照片才判断 live */
+export function showLiveTag(p: PhotoItem): boolean {
+  return p.cat != 'video' && p.live
+}

@@ -1,0 +1,232 @@
+/**
+ * 视频相关的全局开关：清晰度档位（T4.6 / 2026-11-24 扩档）+ HEVC 转 H.264 兼容开关（T4.8）。
+ * 由设置页写入、查看器读取，全局生效。
+ *
+ * 存储键 `fnos.video.quality`，值只允许下面五个字符串
+ * （storage 只能存字符串、读端按枚举比较，见 AGENTS 5.2）。
+ * 用户要求**默认标清**，所以「没存过」和「非法值」一律回落 `sd`。
+ *
+ * 五档的由来（2026-11-24 用户实测后确定）：
+ *   原图        `original` 直链播原文件，不转码；4K 60Mbps 这种在 Wi-Fi 下必然卡，需有线
+ *   NAS转码原画 `native`   源分辨率（短边）+ 码率封顶 20M；画质接近原画但能播
+ *   1080P       `1080`     目标短边 1080，码率封顶 6M
+ *   标清        `sd`       NAS 720 档里码率最小的一档（约 1000k），默认档
+ *   低清        `low`      NAS 能转的全局最低码率（约 200~500k），网络差时用
+ *
+ * 曾有过「2.5K」（`2k`，目标 1440，封顶 12M）—— 2026-11-24 用户要求删掉：
+ * NAS 一般没有 1440 档，实际只能落到 1080，和「1080P」几乎重复，只会让人困惑。
+ * 老机器里存的 `2k` 会按非法值回落默认档（`normalizeVideoQuality` 不认它）。
+ *
+ * HEVC 开关的存储键是 `fnos.video.hevc`（`on` / `off`），**默认关闭**。
+ *
+ * 这里刻意不碰 `uni.getStorageSync`：读写放在页面 / 组件里，
+ * 本文件只提供常量与纯函数，方便两端（uvue / 将来别处）复用。
+ */
+
+/** 存储键：视频清晰度档位 */
+export const VIDEO_QUALITY_KEY = 'fnos.video.quality'
+/** 原图：直链播原画，不发任何转码请求 */
+export const VIDEO_QUALITY_ORIGINAL = 'original'
+/** NAS 转码原画：保持源分辨率，码率封顶（否则和原画一样卡） */
+export const VIDEO_QUALITY_NATIVE = 'native'
+/** 1080P：目标短边 1080 */
+export const VIDEO_QUALITY_1080 = '1080'
+/** 标清：NAS 转码 720P 左右（H.264） */
+export const VIDEO_QUALITY_SD = 'sd'
+/** 低清：NAS 转码 480P 左右（H.264） */
+export const VIDEO_QUALITY_LOW = 'low'
+/** 默认档位（用户要求默认标清） */
+export const VIDEO_QUALITY_DEFAULT = 'sd'
+
+/**
+ * 存储键：HEVC（H.265）转 H.264 兼容开关（T4.8）。
+ *
+ * 默认**关闭**：关闭时行为与以前完全一致（原画 → 原画直链 → 下载到本地再播）。
+ * 开启后，原画放不出来（老盒子不支持 HEVC 硬解，通常表现为 `@error` 或只有声音）时，
+ * 会让 NAS 转一份 H.264 的 HLS 从当前进度续播，而不是「下载同一个 HEVC 文件再播」。
+ */
+export const VIDEO_HEVC_KEY = 'fnos.video.hevc'
+/** 开关：开启 */
+export const VIDEO_HEVC_ON = 'on'
+/** 开关：关闭（默认） */
+export const VIDEO_HEVC_OFF = 'off'
+/** 默认值：关闭 */
+export const VIDEO_HEVC_DEFAULT = 'off'
+
+/** 设置页右栏的一行单选 */
+export type VideoQualityOption = {
+  /** 存储值：见上面五个常量 */
+  value: string
+  /** 显示名：原图 / NAS转码原画 / 1080P / 标清 / 低清 */
+  label: string
+  /** 一行说明，压在该行下面 */
+  desc: string
+}
+
+/**
+ * 五档（顺序即设置页从上到下的顺序）。
+ *
+ * 用「显式类型的常量 + push」而不是 `{...} as VideoQualityOption`：
+ * 纯 .uts 模块里的对象字面量直接 as 强转在 Kotlin 侧容易推不出类型，
+ * 显式类型声明最稳。
+ */
+export function videoQualityOptions(): Array<VideoQualityOption> {
+  const original: VideoQualityOption = {
+    value: VIDEO_QUALITY_ORIGINAL,
+    label: '原图',
+    desc: '直接播原始画质，不经过 NAS 转码（4K 高码率需要有线网络才不卡）'
+  }
+  const native: VideoQualityOption = {
+    value: VIDEO_QUALITY_NATIVE,
+    label: 'NAS转码原画',
+    desc: '保持源分辨率，让 NAS 转码并把码率压到 20M 以内；画质接近原画，Wi-Fi 也能播'
+  }
+  const p1080: VideoQualityOption = {
+    value: VIDEO_QUALITY_1080,
+    label: '1080P',
+    desc: '目标 1080P，码率不超过 6M'
+  }
+  const sd: VideoQualityOption = {
+    value: VIDEO_QUALITY_SD,
+    label: '标清',
+    desc: 'NAS 转码为 720P 左右（H.264），默认档位'
+  }
+  const low: VideoQualityOption = {
+    value: VIDEO_QUALITY_LOW,
+    label: '低清',
+    desc: '取 NAS 能转的最低档（一般 480P 左右），网络差时更流畅'
+  }
+  const list: Array<VideoQualityOption> = []
+  list.push(original)
+  list.push(native)
+  list.push(p1080)
+  list.push(sd)
+  list.push(low)
+  return list
+}
+
+/** 规范化存储值：只认五个合法值，其它（含空串 / "true" / 旧的 "2k"）一律回落默认档 */
+export function normalizeVideoQuality(raw: string): string {
+  if (raw == VIDEO_QUALITY_ORIGINAL) {
+    return VIDEO_QUALITY_ORIGINAL
+  }
+  if (raw == VIDEO_QUALITY_NATIVE) {
+    return VIDEO_QUALITY_NATIVE
+  }
+  if (raw == VIDEO_QUALITY_1080) {
+    return VIDEO_QUALITY_1080
+  }
+  if (raw == VIDEO_QUALITY_LOW) {
+    return VIDEO_QUALITY_LOW
+  }
+  return VIDEO_QUALITY_DEFAULT
+}
+
+/** 档位显示名（状态行「转码中…（标清）」用），未知值按默认档显示 */
+export function videoQualityLabel(value: string): string {
+  const v = normalizeVideoQuality(value)
+  if (v == VIDEO_QUALITY_ORIGINAL) {
+    return '原图'
+  }
+  if (v == VIDEO_QUALITY_NATIVE) {
+    return 'NAS转码原画'
+  }
+  if (v == VIDEO_QUALITY_1080) {
+    return '1080P'
+  }
+  if (v == VIDEO_QUALITY_LOW) {
+    return '低清'
+  }
+  return '标清'
+}
+
+/**
+ * 档位对应的目标分辨率（短边像素）。
+ *
+ * `sourceShortSide`：源视频短边（`decode/info` 的 `videoStreamInfo[0].width/height` 取小的那个），
+ * 只有「NAS转码原画」用得上；源信息缺失时按 2160 猜（大多数电视盒子够不着更高）。
+ *
+ * 真实可用的档位由 NAS 决定（`quality[]` 里的 `resolution` 是短边：`4k` / `1080` / `720`…），
+ * 选档时按「最接近目标」挑，具体见 `PhotoViewer.prepareTranscode`。
+ */
+export function videoQualityTargetHeight(value: string, sourceShortSide: number): number {
+  const v = normalizeVideoQuality(value)
+  if (v == VIDEO_QUALITY_LOW) {
+    return 480
+  }
+  if (v == VIDEO_QUALITY_SD) {
+    return 720
+  }
+  if (v == VIDEO_QUALITY_1080) {
+    return 1080
+  }
+  // NAS转码原画：源短边；没拿到源信息时按 4K 处理
+  return sourceShortSide > 0 ? sourceShortSide : 2160
+}
+
+/**
+ * 档位的码率上限（bit/s），0 表示「不封顶，取该分辨率里码率最小的那档」。
+ *
+ * 为什么必须封顶：NAS 的 `4k` 档列表里第一项就是源码率（实测 61.7Mbps），
+ * 不封顶等于换个方式播原画，Wi-Fi 下照样卡。上限按「实测链路 ~66Mbps，留 3 倍余量」定。
+ */
+export function videoQualityBitrateCap(value: string): number {
+  const v = normalizeVideoQuality(value)
+  if (v == VIDEO_QUALITY_NATIVE) {
+    return 20000000
+  }
+  if (v == VIDEO_QUALITY_1080) {
+    return 6000000
+  }
+  return 0
+}
+
+/**
+ * NAS 清晰度字符串 → 短边像素。
+ *
+ * ⚠️ 不能直接 `parseInt`：`parseInt("4k")` 会得到 `4`，导致 4K 档永远选不中（历史 bug）。
+ */
+export function resolutionHeight(resolution: string): number {
+  if (resolution.length == 0) {
+    return 0
+  }
+  const lower = resolution.toLowerCase()
+  if (lower == '8k') {
+    return 4320
+  }
+  if (lower == '4k') {
+    return 2160
+  }
+  if (lower == '2.5k' || lower == '2k') {
+    return 1440
+  }
+  return parseInt(resolution)
+}
+
+/** 清晰度字符串的展示名：`4k` → `4K`、`1080` → `1080p` */
+export function resolutionDisplay(resolution: string): string {
+  const lower = resolution.toLowerCase()
+  if (lower == '8k') {
+    return '8K'
+  }
+  if (lower == '4k') {
+    return '4K'
+  }
+  if (lower == '2.5k' || lower == '2k') {
+    return '2.5K'
+  }
+  return resolution + 'p'
+}
+
+/**
+ * 规范化 HEVC 兼容开关：只认 `on`，其它（含空串 / 旧数据 / "true"）一律视为关闭。
+ * 默认关闭，所以「没存过」也走关闭分支（AGENTS 5.2 的 storage 铁律）。
+ */
+export function normalizeHevcCompat(raw: string): string {
+  return raw == VIDEO_HEVC_ON ? VIDEO_HEVC_ON : VIDEO_HEVC_OFF
+}
+
+/** 开关是否开启（读端按枚举比较，不做真值判断） */
+export function isHevcCompatOn(raw: string): boolean {
+  return normalizeHevcCompat(raw) == VIDEO_HEVC_ON
+}

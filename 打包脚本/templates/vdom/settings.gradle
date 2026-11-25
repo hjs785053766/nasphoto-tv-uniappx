@@ -1,0 +1,30 @@
+pluginManagement {
+    repositories {
+        maven { url 'https://maven.aliyun.com/repository/google' }
+        maven { url 'https://maven.aliyun.com/repository/gradle-plugin' }
+        gradlePluginPortal()
+        google()
+        mavenCentral()
+        maven { url 'https://jitpack.io' }
+    }
+}
+
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        // uni-app x 原生 SDK 自带的 gradle 插件 jar
+        flatDir { dirs('plugins') }
+        maven { url 'https://maven.aliyun.com/repository/google' }
+        maven { url 'https://maven.aliyun.com/repository/public' }
+        maven { url 'https://maven.aliyun.com/repository/central' }
+        maven { url 'https://maven.aliyun.com/repository/gradle-plugin' }
+        maven { url = uri("https://jitpack.io") }
+        google()
+        mavenCentral()
+    }
+}
+
+rootProject.name = "uniappx-offline-vdom"
+include ':app'
+include ':uniappx'
+include ':uts-fnos-auth'

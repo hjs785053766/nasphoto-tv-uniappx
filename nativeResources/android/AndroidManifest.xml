@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  电视启动器（Leanback）配置。
+
+  uni-app x（VDOM 模式）首页 Activity 为 io.dcloud.uniapp.UniAppActivity，
+  这里给它追加一份 LEANBACK_LAUNCHER intent-filter：
+
+    - 原生 Android TV / Google TV 的 Leanback 桌面只会列出带该 category 的应用；
+    - 国内电视盒子一般不强制，不加也能在「应用列表」里找到。
+
+  注意：
+    1. package 属性为占位值，请改成云打包时使用的 Android 包名；
+    2. 该文件需要云打包（或自定义基座）才生效；
+    3. 若云打包报 AndroidManifest 合并冲突，删掉本文件即可，不影响登录功能。
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    package="io.dcloud.nasphototv">
+
+    <uses-feature
+        android:name="android.software.leanback"
+        android:required="false" />
+    <uses-feature
+        android:name="android.hardware.touchscreen"
+        android:required="false" />
+
+    <application>
+        <activity
+            android:name="io.dcloud.uniapp.UniAppActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

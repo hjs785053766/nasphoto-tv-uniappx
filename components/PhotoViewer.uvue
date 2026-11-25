@@ -1,0 +1,3073 @@
+<template>
+	<view class="viewer">
+		<view class="vw-stage">
+			<!--
+				双缓冲图片（消除「换原图 / 换下一张」时的黑屏闪烁）：
+				新地址永远先塞进**后层**并保持透明，等它 @load 之后只切换前后层级，
+				不重新赋 src —— 前台始终有一张已经解码好的图，原生 ImageView 不会空一帧。
+			-->
+			<image
+				v-if="imgA.length > 0"
+				class="vw-img"
+				:class="frontIsB ? 'vw-img-back' : 'vw-img-front'"
+				:src="imgA"
+				mode="aspectFit"
+				@load="onImgALoad"
+				@error="onImgAError"
+			/>
+			<image
+				v-if="imgB.length > 0"
+				class="vw-img"
+				:class="frontIsB ? 'vw-img-front' : 'vw-img-back'"
+				:src="imgB"
+				mode="aspectFit"
+				@load="onImgBLoad"
+				@error="onImgBError"
+			/>
+			<view class="vw-hint" v-if="imgA.length == 0 && imgB.length == 0">
+				<text class="vw-hint-text">加载中…</text>
+			</view>
+
+			<!-- 实况照片的动态片段：打开时自动盖在静态图上播一遍，播完卸载回到图片。
+			     控件全关（TV 用遥控器，浏览器有右上角按钮）；是否静音由 liveMuted 控制；
+			     @play 既判断浏览器有没有放行，也用作「出画面了再把 video 露出来」的信号 -->
+			<video
+				v-if="livePlaying && liveSrc.length > 0"
+				:key="liveKey"
+				:class="liveClass()"
+				:src="liveSrc"
+				:autoplay="true"
+				:controls="false"
+				:show-center-play-btn="false"
+				:show-play-btn="false"
+				:show-progress="false"
+				:show-fullscreen-btn="false"
+				:show-loading="false"
+				:muted="liveMuted"
+				object-fit="contain"
+				@play="onLivePlay"
+				@timeupdate="onLiveTime"
+				@ended="onLiveEnded"
+				@error="onLiveError"
+			/>
+
+			<!-- 视频文件：直链播放（App 端靠 :header 给每个请求带 AccessToken，
+			     包括清晰度切换后的 HLS 分片），不先下载整段视频；
+			     进入查看器**不自动播放**，用户按 OK 才挂载 <video> -->
+			<!-- 属性保持最小集：控件全关已经在 CSS/下面 UI 里做了，
+			     `:header` 也不需要（App 端走本机代理，token 由代理补）,
+			     少传一个 prop 就少一次 prop 更新，VDOM 下更稳。
+
+			     ⚠️ `:controls="false"` 关不掉**居中播放按钮**：uni 的 video 有独立的
+			     `show-center-play-btn`（默认 true）。竖屏转码时我们把整个 video 转了 90°，
+			     这个内置按钮会跟着转成「朝下」（用户实测反馈），所以必须显式关掉。
+			     自绘控制条只画在元素外面，不受旋转影响。 -->
+			<video
+				v-if="videoStarted"
+				:id="videoElId"
+				class="vw-video"
+				:style="videoBoxStyle"
+				:src="videoSrc"
+				:autoplay="videoAutoplay"
+				:controls="false"
+				:show-center-play-btn="false"
+				:show-play-btn="false"
+				:show-progress="false"
+				:show-fullscreen-btn="false"
+				:enable-progress-gesture="false"
+				object-fit="contain"
+				@play="onVideoPlay"
+				@pause="onVideoPause"
+				@ended="onVideoEnded"
+				@timeupdate="onVideoTime"
+				@waiting="onVideoWaiting"
+				@error="onVideoError"
+			/>
+
+			<!-- 缓冲提示：转圈 + 已缓冲秒数。用户分不清「App 卡死 / 网络卡 / 视频本身卡」，
+			     有了这个至少能看出「有反应、只是在等数据」，秒数一直涨就是网络慢 -->
+			<view class="vw-buffer" v-if="videoStarted && (videoFirstFrame || videoBuffering) && videoError.length == 0">
+				<view class="vw-buffer-box">
+					<view class="vw-buffer-ring" :style="spinStyle"></view>
+					<text class="vw-buffer-text">{{ bufferText() }}</text>
+				</view>
+			</view>
+
+			<!-- 左右切换热区：遥控器左右键与鼠标点击都能用。
+			     视频模式下左右键改成了快进/后退，热区必须收起，否则点一下会跳片 -->
+			<view class="vw-side vw-side-left" v-if="!videoSeekable() && canPrev" @click="requestNav(-1)">
+				<text class="vw-side-text">‹</text>
+			</view>
+			<view class="vw-side vw-side-right" v-if="!videoSeekable() && canNext" @click="requestNav(1)">
+				<text class="vw-side-text">›</text>
+			</view>
+		</view>
+
+		<!-- 视频控制区：放在画面下方而不是叠在画面上（App 原生 video 会压住覆盖层）。
+		     上排：状态文案 + 倍速；下排：播放键 + 进度条 -->
+		<view class="vp-wrap" v-if="viewerIsVideo()">
+			<view class="vp-line">
+				<text class="vp-state">{{ videoStateText() }}</text>
+				<view class="vp-line-right">
+					<!-- 倍速：点一下往后切一档、到头循环（TV 用「上」键，等价） -->
+					<text class="vp-chip" @click="cycleVideoRate">{{ videoRateText() }}</text>
+				</view>
+			</view>
+			<view class="vp-bar">
+				<view class="vp-ico" @click="toggleVideoPlay">
+					<text class="vp-ico-text" v-if="videoPreparing">…</text>
+					<view class="vp-ico-pause" v-else-if="videoPlaying">
+						<view class="vp-ico-bar"></view>
+						<view class="vp-ico-bar"></view>
+					</view>
+					<text class="vp-ico-text" v-else>▶</text>
+				</view>
+				<text class="vp-time">{{ videoPosText }}</text>
+				<view class="vp-track">
+					<view class="vp-fill" :style="videoFillStyle"></view>
+				</view>
+				<text class="vp-time">{{ videoDurText }}</text>
+			</view>
+		</view>
+
+		<!-- 详情面板：图片下方、左右铺满。
+		     左栏人物 / 相册（带头像与封面，多人自动换行），右栏参数（两列，长字段整行） -->
+		<view class="vw-info" v-if="viewerInfo">
+			<view class="vw-info-left">
+				<view class="vw-sec" v-if="infoPersons.length > 0">
+					<text class="vw-sec-title">人物</text>
+					<view class="vw-chips">
+						<view class="vw-person" v-for="(pv, i) in infoPersons" :key="pv.name">
+							<image
+								class="vw-avatar"
+								v-if="pv.src.length > 0"
+								:src="pv.src"
+								mode="aspectFill"
+								@error="onPersonImgError(i)"
+							/>
+							<view class="vw-avatar vw-avatar-ph" v-else>
+								<text class="vw-avatar-ph-text">{{ pv.initial }}</text>
+							</view>
+							<text class="vw-person-name">{{ pv.name }}</text>
+						</view>
+					</view>
+				</view>
+
+				<view class="vw-sec" v-if="infoAlbums.length > 0">
+					<text class="vw-sec-title">相册</text>
+					<view class="vw-album" v-for="(al, i) in infoAlbums" :key="al.name">
+						<image
+							class="vw-album-cover"
+							v-if="al.src.length > 0"
+							:src="al.src"
+							mode="aspectFill"
+							@error="onAlbumImgError(i)"
+						/>
+						<view class="vw-album-cover vw-avatar-ph" v-else>
+							<text class="vw-avatar-ph-text">册</text>
+						</view>
+						<view class="vw-album-meta">
+							<text class="vw-album-name">{{ al.name }}</text>
+							<text class="vw-album-sub">{{ al.sub }}</text>
+						</view>
+					</view>
+				</view>
+
+				<text class="vw-info-loading" v-if="infoLoading">正在读取详细信息…</text>
+			</view>
+
+			<view class="vw-info-right">
+				<view class="vw-field" :class="f.full ? 'vw-field-full' : ''" v-for="f in infoFields" :key="f.label">
+					<text class="vw-field-label">{{ f.label }}</text>
+					<text class="vw-field-value">{{ f.value }}</text>
+				</view>
+			</view>
+		</view>
+
+		<!-- TV 端用遥控器返回键关闭、下键看详情；浏览器没有按键通道，才显示这几个按钮 -->
+		<!-- #ifdef WEB -->
+		<view class="vw-tools">
+			<!-- 视频文件：浏览器没有遥控器按键通道，用这两个按钮等价「左 / 右键 ±10 秒」 -->
+			<view class="vw-tool" v-if="videoSeekable()" @click="seekVideo(-VIDEO_SEEK_STEP)">
+				<text class="vw-tool-text">«</text>
+			</view>
+			<view class="vw-tool" v-if="videoSeekable()" @click="seekVideo(VIDEO_SEEK_STEP)">
+				<text class="vw-tool-text">»</text>
+			</view>
+			<!-- 实况照片重播（遥控器 OK 键在 TV 上等价） -->
+			<view class="vw-tool" v-if="canReplayLive()" @click="replayLive">
+				<text class="vw-tool-text">▶</text>
+			</view>
+			<view class="vw-tool" @click="toggleViewerInfo">
+				<text class="vw-tool-text">!</text>
+			</view>
+			<view class="vw-tool" @click="closeSelf">
+				<text class="vw-tool-text">✕</text>
+			</view>
+		</view>
+		<!-- #endif -->
+	</view>
+</template>
+
+<script setup lang="uts">
+	import {
+		image,
+		video,
+		mediaUrl,
+		videoHeader,
+		videoInfo,
+		videoPlay,
+		photoDetail,
+		startTvKeyHook,
+		stopTvKeyHook,
+		appLog
+	} from '@/uni_modules/fnos-auth'
+	import { PhotoItem } from '@/common/photo.uts'
+	import { KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_OK, KEY_ENTER, KEY_BACK, KEY_MENU, KEY_REPEAT_MS, KeyDebounce, dispatchKey } from '@/common/keys.uts'
+	import {
+		VIDEO_QUALITY_KEY,
+		VIDEO_QUALITY_ORIGINAL,
+		VIDEO_QUALITY_LOW,
+		VIDEO_HEVC_KEY,
+		normalizeVideoQuality,
+		isHevcCompatOn,
+		videoQualityLabel,
+		videoQualityTargetHeight,
+		videoQualityBitrateCap,
+		resolutionHeight,
+		resolutionDisplay
+	} from '@/common/video.uts'
+
+	/**
+	 * 照片查看器（图库 / 相册共用的唯一实现）。
+	 *
+	 * 数据与导航都不在这里：组件只负责「当前这张」的
+	 * 图片 / 视频 / 实况 / 详情，以及遥控器按键；
+	 * 上一张 / 下一张通过 `nav` 事件交回页面（图库那边还要跨页补数据）。
+	 * 关闭由 `close` 事件交回页面（页面负责恢复滚动位置、重新订阅按键）。
+	 */
+	const props = defineProps<{
+		photos: Array<PhotoItem>
+		index: number
+		canPrev: boolean
+		canNext: boolean
+	}>()
+
+	const emit = defineEmits<{
+		(e: 'close'): void
+		(e: 'nav', delta: number): void
+	}>()
+
+	/** 详情右栏的一个字段；full=true 时独占一行（文件名/路径/位置） */
+	type InfoField = {
+		label: string
+		value: string
+		full: boolean
+	}
+
+	/** 详情左栏的人物：头像异步下载完后填 src，失败则回退首字圆块 */
+	type PersonView = {
+		name: string
+		initial: string
+		path: string
+		src: string
+	}
+
+	/** 详情左栏的相册：封面同人物头像一样异步加载 */
+	type AlbumView = {
+		name: string
+		sub: string
+		path: string
+		src: string
+	}
+
+	/** 组件是否还活着（替代原页面的 viewerOpen；卸载后在途回调全部作废） */
+	let alive = true
+	let keyHook = 0
+
+	// ---------------- 图片（双缓冲） ----------------
+
+	/** 两层图：A / B 交替当前台，谁在前由 frontIsB 决定 */
+	const imgA = ref('')
+	const imgB = ref('')
+	/** 前层是不是 B；只切层级不改 src（改 src 会让原生 ImageView 重新解码 → 黑一帧） */
+	const frontIsB = ref(false)
+	/** 正在等哪一层 load：1 = A，2 = B，0 = 没有 */
+	let imgPending = 0
+
+	/** 每次切换 +1：丢弃上一张迟到的下载回调，避免快速左右切时旧图盖回来 */
+	let viewerSeq = 0
+	/** 个别 ROM 的 <image> 只认 file://，加载失败时补一次前缀重试 */
+	let viewerTriedFile = false
+
+	/** 双缓冲的兜底定时器：见 armPromoteFallback */
+	let imgPromoteTimer = 0
+
+	/**
+	 * 「按了播放但一直没进度」的看门狗定时器（见 armVideoWatch）。
+	 * 必须声明在 `clearViewerImage()` **之前** —— UTS 编译成 Kotlin 局部变量，后声明不能先使用。
+	 */
+	let videoWatchTimer = 0
+
+	/**
+	 * 兜底：`<image>` 的 `@load` 在某些平台**不保证回调**（web 实测：翻页后 index 变了、
+	 * 画面永远停在上一次，因为后层永远切不到前台）。
+	 * 所以换完图再挂一个定时器，迟迟收不到 `@load` 也强制切前台。
+	 */
+	function armPromoteFallback() {
+		if (imgPromoteTimer != 0) {
+			clearTimeout(imgPromoteTimer)
+		}
+		imgPromoteTimer = setTimeout(() => {
+			imgPromoteTimer = 0
+			if (imgPending == 0) {
+				return
+			}
+			frontIsB.value = imgPending == 2
+			imgPending = 0
+		}, 700)
+	}
+
+	/**
+	 * 换图入口。
+	 *
+	 * - **web**：直接单图替换（uni-app x web 的 `<image>` 不保证回调 `@load`，
+	 *   双缓冲会让后层永远切不到前台 → 「翻页后 id 变了画面不变」，2026-11-22 用户实测）。
+	 *   浏览器自己会保留上一帧，不会像原生那样黑一帧。
+	 * - **App**：新地址先进**后层**，`@load` 到了再切前后层（+ 700ms 兜底），
+	 *   全程前台都有已解码的图，所以换原图/换下一张不黑屏。
+	 */
+	function setViewerImage(src: string) {
+		if (src.length == 0) {
+			return
+		}
+		// #ifdef WEB
+		imgPending = 0
+		imgB.value = ''
+		frontIsB.value = false
+		imgA.value = src
+		return
+		// #endif
+		// 首次：直接进 A
+		if (imgA.value.length == 0) {
+			imgPending = 1
+			imgA.value = src
+			armPromoteFallback()
+			return
+		}
+		// B 还空着：进 B
+		if (imgB.value.length == 0) {
+			imgPending = 2
+			imgB.value = src
+			armPromoteFallback()
+			return
+		}
+		// 两层都有：覆盖后层（前层不动，用户看不到这次加载）
+		if (frontIsB.value) {
+			imgPending = 1
+			imgA.value = src
+		} else {
+			imgPending = 2
+			imgB.value = src
+		}
+		armPromoteFallback()
+	}
+
+	function onImgALoad() {
+		// 只有「我们刚换了 A」才算数，避免重复 load 事件把层级来回翻
+		if (imgPending != 1) {
+			return
+		}
+		imgPending = 0
+		frontIsB.value = false
+	}
+
+	function onImgBLoad() {
+		if (imgPending != 2) {
+			return
+		}
+		imgPending = 0
+		frontIsB.value = true
+	}
+
+	/** 个别 ROM 只认 file://：同一层补一次前缀重试（每张图只试一次） */
+	function retryImgWithFile(isB: boolean) {
+		// #ifdef APP-ANDROID
+		if (viewerTriedFile) {
+			return
+		}
+		const cur = isB ? imgB.value : imgA.value
+		if (cur.length == 0 || cur.startsWith('file://')) {
+			return
+		}
+		viewerTriedFile = true
+		if (isB) {
+			imgPending = 2
+			imgB.value = 'file://' + cur
+		} else {
+			imgPending = 1
+			imgA.value = 'file://' + cur
+		}
+		// #endif
+	}
+
+	function onImgAError() {
+		retryImgWithFile(false)
+	}
+
+	function onImgBError() {
+		retryImgWithFile(true)
+	}
+
+	/** 清空两层（关闭查看器时用）：不 reset 会把上一张的位图留在内存里 */
+	function clearViewerImage() {
+		if (imgPromoteTimer != 0) {
+			clearTimeout(imgPromoteTimer)
+			imgPromoteTimer = 0
+		}
+		// 播放看门狗也一起收掉（它定义在后面，这里直接操作变量）
+		if (videoWatchTimer != 0) {
+			clearTimeout(videoWatchTimer)
+			videoWatchTimer = 0
+		}
+		imgPending = 0
+		frontIsB.value = false
+		imgA.value = ''
+		imgB.value = ''
+	}
+
+	// ---------------- 详情面板 ----------------
+
+	/** 详情面板是否展开（TV 下键打开 / 上键关闭，浏览器点感叹号） */
+	const viewerInfo = ref(false)
+	const infoFields = ref<Array<InfoField>>([])
+	const infoPersons = ref<Array<PersonView>>([])
+	const infoAlbums = ref<Array<AlbumView>>([])
+	const infoLoading = ref(false)
+
+	// ---------------- 实况片段 ----------------
+
+	const livePlaying = ref(false)
+	const liveSrc = ref('')
+	/** 每次播放 +1 强制重建 <video>：同一个 src 重复赋值不会回到第一帧 */
+	const liveKey = ref(0)
+	let liveTriedFile = false
+	/**
+	 * 是否静音。默认**不静音**：实况片段本来就该带原声。
+	 * 只有浏览器拦下「有声自动播放」时才回退成静音，见 playLive 末尾的 700ms 兜底。
+	 */
+	const liveMuted = ref(false)
+	let liveSeq = 0
+	let liveStarted = false
+	/** 片段是否已经出画面：<video> 挂载到首帧之间先透明，避免黑底与原生播放按钮 */
+	const liveReady = ref(false)
+
+	// ---------------- 视频 ----------------
+
+	/** 左右键每次快进 / 后退的秒数 */
+	const VIDEO_SEEK_STEP = 10.0
+	/**
+	 * 倍速档位：与 fnOS web 端同一组值，但**按升序**放，方便「点一下往后加、到头循环」：
+	 * 0.5 → 0.75 → 1.0 → 1.5 → 2.0 → 0.5 …
+	 */
+	const VIDEO_RATES: Array<number> = [0.5, 0.75, 1.0, 1.5, 2.0]
+	/** 默认倍速下标：VIDEO_RATES 里 1.0x 的位置。**每个视频打开都回到这一档** */
+	const VIDEO_RATE_DEFAULT = 2
+
+	const videoSrc = ref('')
+	/** 每次换片 / 重挂 +1 强制重建 <video> */
+	let videoCtx: VideoContext | null = null
+	/** <video> 的请求头：App 端 ExoPlayer 会把它注入每个请求（含 HLS 分片）；没 token 时是空对象 */
+	const videoHeaderObj = ref<UTSJSONObject>(JSON.parseObject('{}')!)
+	/** 是否已经挂载 <video>：**进入查看器不自动播**，按 OK 才挂载 */
+	const videoStarted = ref(false)
+	const videoAutoplay = ref(false)
+	const videoStartPos = ref(0.0)
+	const videoPlaying = ref(false)
+	const videoEnded = ref(false)
+	const videoPreparing = ref(false)
+	/** 不可播的原因（地址缺失 / 下载失败 / 解码失败），非空时状态条直接显示 */
+	const videoError = ref('')
+	const videoPos = ref(0.0)
+	const videoDur = ref(0.0)
+	let videoSeekTarget = -1.0
+	/** seek 保护区截止时间：这之前忽略 timeupdate 的 currentTime，否则进度条会被旧值拉回 */
+	let videoHoldUntil = 0
+	/** 快进 / 快退去抖：连按只发最后一次 seek（T5 的统一去抖工具，见 common/keys.uts） */
+	const videoSeekDebounce = new KeyDebounce(KEY_REPEAT_MS)
+	let videoSeq = 0
+	let videoFallbackTried = false
+	const videoHint = ref('')
+	let videoHintTimer = 0
+	const videoRateIndex = ref(VIDEO_RATE_DEFAULT)
+
+	/** 转码准备的超时时间（毫秒）：NAS 忙 / 签名被拒时不能一直转圈（T4.6） */
+	const TRANSCODE_TIMEOUT_MS = 9000
+	/** 当前视频是否正在等服务端转码（状态行显示「转码中…」） */
+	const videoTranscoding = ref(false)
+	/**
+	 * 缓冲（网络）状态。
+	 *
+	 * 起因：用户分不清「App 卡死 / 网络卡 / 视频本身就卡」。
+	 * 收到 waiting 事件就转圈，并把已缓冲时长写在圈下面，网络慢时数字会一直涨，
+	 * 一眼能区分「有反应但网慢」和「真死了」。
+	 */
+	const videoBuffering = ref(false)
+	/** 已缓冲秒数（每 100ms 的定时器里按秒更新，避免每帧刷新文案） */
+	const bufferSeconds = ref(0)
+	/**
+	 * <video> 的元素 id。
+	 *
+	 * 重播时必须换一个新 id：uni 的原生播放器是按元素 id 复用的 ——
+	 * 只把 v-if 关掉再开（id 不变）会**沿用同一个 ExoPlayer 实例**，位置仍是片尾，
+	 * 真机实测：重建后代理确实重新拉了流（bytes=40-），但状态行很快又回到「已结束」。
+	 */
+	const videoElId = ref('pw-video')
+	/** 转圈角度（uvue 不支持 CSS keyframes，这里用定时器改 transform） */
+	const spinAngle = ref(0)
+	let bufferTimer = 0
+	let bufferStartAt = 0
+	/**
+	 * 「已经挂上源、但还没出第一帧」。
+	 *
+	 * 真机实测：原画 4K 那段从按 OK 到出画面最长要 8 秒（最后还走了下载兜底），
+	 * 这 8 秒里原来界面一无所有，用户以为是 App 卡死。现在这段也转圈，文案是「正在加载…」。
+	 */
+	const videoFirstFrame = ref(false)
+	/** 最近一次 timeupdate 的时间戳：看门狗用它判断「播放中是否停住了」 */
+	let lastProgressAt = 0
+	/**
+	 * 上一次看到的播放位置。
+	 *
+	 * ⚠️ 判断「有没有进度」必须比**位置有没有变**，不能比「位置 > 0」：
+	 * 卡住时 timeupdate 照样按固定频率回调，只是 currentTime 不再前进；
+	 * 之前写的是 `if (t > 0.05) lastProgressAt = now`，每来一次回调就把时间戳刷新一遍，
+	 * 于是看门狗永远判定「刚刚还有进度」→ 真机上表现为「卡的时候根本不显示转圈」。
+	 */
+	let lastPosSeen = -1.0
+	let stallTimer = 0
+	/** 当前这条流是不是转码流（播放中要标注档位，失败回退时要判断） */
+	const videoTranscodeOn = ref(false)
+	/** 当前视频的目标档位显示名（原画 / 标清 / 低清），状态行用；回退后改成「原画」 */
+	const videoQualityShown = ref('标清')
+	/** 从 `decode/info` 里实际选中的分辨率（如 "720"，状态行显示 720p）；原画时为空 */
+	const videoChosenRes = ref('')
+	/**
+	 * 源视频的旋转角（度）与编码宽高，来自 `decode/info` 的 `videoStreamInfo[0]`。
+	 *
+	 * 手机竖屏视频的真实形态是「横向帧 + 旋转标记」（实测 3840×2160 + rotation=-90），
+	 * mp4 容器里 ExoPlayer 会自己转，但 NAS 的**转码流（HLS/TS）不带旋转信息**，
+	 * 转出来就是 1280×720 躺倒的画面 → 用户看到「竖屏变横屏」。
+	 * 所以只有转码链路需要拿这三个值在客户端把 `<video>` 转回来。
+	 */
+	const videoSourceRotation = ref(0)
+	const videoSourceWidth = ref(0)
+	const videoSourceHeight = ref(0)
+	/** `<video>` 的内联样式：需要补旋转时给出「旋转前」的盒子尺寸与角度，空串表示跟随 CSS */
+	const videoBoxStyle = ref('')
+	/** 转码请求序号：换片 / 关查看器后丢弃迟到的回调 */
+	let videoTranscodeSeq = 0
+	let videoTranscodeTimer = 0
+	/** 转码期间用户按过 OK：转码就绪后直接开播，不用再按一次 */
+	let videoPendingStart = false
+	/** 是否已经因转码失败回退过原画直链（避免来回弹） */
+	let videoTriedDirectFallback = false
+	/** 这个视频要不要走转码（档位不是原图且 App 端）：按 OK 时才真正申请，别在浏览时白转 */
+	let videoNeedTranscode = false
+	/**
+	 * HEVC 兼容开关（T4.8，设置页 `fnos.video.hevc`，默认关闭）。
+	 * 每次打开视频时读一次；关闭时整条 HEVC 兜底不生效，行为与以前完全一致。
+	 */
+	let videoHevcCompat = false
+	/** 已经为这个视频申请过「H.264 兼容转码」：避免了「直链错 → 转码错 → 又回直链」的来回弹 */
+	let videoTriedHevcTranscode = false
+	/** HEVC 兜底转码时状态行显示的档位名（不是用户选的清晰度，所以单独一个常量） */
+	const VIDEO_HEVC_LABEL = 'H.264兼容'
+	/**
+	 * 排障用：这次播放有没有拿到 `AccessToken` 请求头。
+	 * `<video :header>` 是 App 端直链 / HLS 唯一的鉴权方式，拿不到就必然 401 →
+	 * ExoPlayer 只报一句笼统的 `Source error`，所以把「头有没有」显示到状态行上。
+	 */
+	const videoHeaderOk = ref(false)
+
+	/**
+	 * 进度条轨道可用的 rpx 宽度：610 = 750 − 条左右内边距 24 − 图标 24 − 两个时间 80
+	 * − 轨道左右外边距 12。改 .vp-bar / .vp-ico / .vp-time 的尺寸必须同步这里。
+	 */
+	const VP_TRACK_RPX = 610.0
+
+	/** 当前照片；index 越界时返回 null（页面在切换期间可能短暂越界） */
+	function currentPhoto(): PhotoItem | null {
+		const list = props.photos
+		if (props.index < 0 || props.index >= list.length) {
+			return null
+		}
+		return list[props.index]
+	}
+
+	/** 0=周日；用算术算，避免依赖 Date 的时区行为 */
+	function weekdayOf(y: number, m: number, d: number): string {
+		const table = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4]
+		const yy = m < 3 ? y - 1 : y
+		const w = (yy + Math.floor(yy / 4) - Math.floor(yy / 100) + Math.floor(yy / 400) + table[m - 1] + d) % 7
+		const names = ['周日', '周一', '周二', '周三', '周四', '周五', '周六']
+		return names[w]
+	}
+
+	/** 从 URL 里兜底取文件名（服务端没给 fileName 时用） */
+	function baseName(path: string): string {
+		if (path.length == 0) {
+			return ''
+		}
+		let s = path
+		const q = s.indexOf('?')
+		if (q >= 0) {
+			s = s.substring(0, q)
+		}
+		const slash = s.lastIndexOf('/')
+		if (slash >= 0) {
+			s = s.substring(slash + 1)
+		}
+		return s
+	}
+
+	/** "2026:11:02 17:27:09" → "2026-11-02 周日 17:27"（与 Web 版详情一致，去掉秒） */
+	function dateTimeText(dt: string): string {
+		if (dt.length < 16) {
+			return dt
+		}
+		const y = parseInt(dt.substring(0, 4))
+		const m = parseInt(dt.substring(5, 7))
+		const d = parseInt(dt.substring(8, 10))
+		const hm = dt.substring(11, 16)
+		return y.toString() + '-' + m.toString() + '-' + d.toString() + ' ' + weekdayOf(y, m, d) + ' ' + hm
+	}
+
+	/** 先用列表字段填基础信息（getOne 还没回来时先有东西看） */
+	function updateInfo(p: PhotoItem) {
+		const byUrl = baseName(p.original.length > 0 ? p.original : p.medium)
+		const name = p.name.length > 0 ? p.name : (byUrl.length > 0 ? byUrl : p.id)
+		const fields: Array<InfoField> = []
+		fields.push({ label: '文件名', value: name, full: true } as InfoField)
+		fields.push({ label: '时间', value: dateTimeText(p.dt), full: false } as InfoField)
+		if (p.w > 0 && p.h > 0) {
+			fields.push({ label: '分辨率', value: p.w.toString() + ' × ' + p.h.toString(), full: false } as InfoField)
+		}
+		fields.push({ label: '类型', value: p.cat == 'video' ? '视频' : '照片', full: false } as InfoField)
+		fields.push({ label: 'ID', value: p.id, full: false } as InfoField)
+		infoFields.value = fields
+		infoPersons.value = []
+		infoAlbums.value = []
+		infoLoading.value = false
+	}
+
+	/** 人物头像下载完后整块替换数组（uvue 里直接改对象属性不保证刷新） */
+	async function fillPersonAvatar(index: number, seq: number) {
+		const list = infoPersons.value
+		if (index < 0 || index >= list.length) {
+			return
+		}
+		const item = list[index]
+		if (item.path.length == 0) {
+			return
+		}
+		const local = await image(item.path)
+		if (local.length == 0 || seq != viewerSeq) {
+			return
+		}
+		const next = infoPersons.value.slice()
+		if (index >= next.length) {
+			return
+		}
+		next[index] = { name: item.name, initial: item.initial, path: item.path, src: local } as PersonView
+		infoPersons.value = next
+	}
+
+	async function fillAlbumCover(index: number, seq: number) {
+		const list = infoAlbums.value
+		if (index < 0 || index >= list.length) {
+			return
+		}
+		const item = list[index]
+		if (item.path.length == 0) {
+			return
+		}
+		const local = await image(item.path)
+		if (local.length == 0 || seq != viewerSeq) {
+			return
+		}
+		const next = infoAlbums.value.slice()
+		if (index >= next.length) {
+			return
+		}
+		next[index] = { name: item.name, sub: item.sub, path: item.path, src: local } as AlbumView
+		infoAlbums.value = next
+	}
+
+	/** 头像 / 封面加载失败：退回首字色块，不留空白 */
+	function onPersonImgError(index: number) {
+		const list = infoPersons.value
+		if (index < 0 || index >= list.length) {
+			return
+		}
+		const item = list[index]
+		const next = list.slice()
+		next[index] = { name: item.name, initial: item.initial, path: '', src: '' } as PersonView
+		infoPersons.value = next
+	}
+
+	function onAlbumImgError(index: number) {
+		const list = infoAlbums.value
+		if (index < 0 || index >= list.length) {
+			return
+		}
+		const item = list[index]
+		const next = list.slice()
+		next[index] = { name: item.name, sub: item.sub, path: '', src: '' } as AlbumView
+		infoAlbums.value = next
+	}
+
+	/**
+	 * getOne + 相册 + 人物：文件大小、相机、曝光、路径、地址/坐标只有详情接口有。
+	 * 文本先出，人物头像与相册封面再异步加载；空字段整项不显示。
+	 */
+	async function loadDetail(p: PhotoItem, seq: number) {
+		infoLoading.value = true
+		const d = await photoDetail(p.id)
+		if (seq != viewerSeq || !alive) {
+			return
+		}
+		infoLoading.value = false
+		if (!d.ok) {
+			return
+		}
+		const fields: Array<InfoField> = []
+		let name = d.fileName.length > 0 ? d.fileName : p.name
+		if (name.length == 0) {
+			name = baseName(p.original.length > 0 ? p.original : p.medium)
+		}
+		if (name.length == 0) {
+			name = p.id
+		}
+		fields.push({ label: '文件名', value: name, full: true } as InfoField)
+
+		const time = d.dateTime.length > 0 ? dateTimeText(d.dateTime) : dateTimeText(p.dt)
+		if (time.length > 0) {
+			fields.push({ label: '时间', value: time, full: false } as InfoField)
+		}
+
+		const w = d.width > 0 ? d.width : p.w
+		const h = d.height > 0 ? d.height : p.h
+		// 与 Web 版一致：7.2MP · 2316 × 3088 · 1.64 MB
+		let size = d.mp
+		if (w > 0 && h > 0) {
+			const px = w.toString() + ' × ' + h.toString()
+			size = size.length > 0 ? (size + ' · ' + px) : px
+		}
+		if (d.fileSize.length > 0) {
+			size = size.length > 0 ? (size + ' · ' + d.fileSize) : d.fileSize
+		}
+		if (size.length > 0) {
+			fields.push({ label: '分辨率', value: size, full: false } as InfoField)
+		}
+
+		if (d.camera.length > 0) {
+			fields.push({ label: '设备', value: d.camera, full: false } as InfoField)
+		}
+
+		// 曝光参数合成一项：f/1.9 · 1/143s · ISO20 · 2.7mm
+		let expo = d.aperture
+		if (d.exposure.length > 0) {
+			expo = expo.length > 0 ? (expo + ' · ' + d.exposure) : d.exposure
+		}
+		if (d.iso.length > 0) {
+			expo = expo.length > 0 ? (expo + ' · ' + d.iso) : d.iso
+		}
+		if (d.focal.length > 0) {
+			expo = expo.length > 0 ? (expo + ' · ' + d.focal) : d.focal
+		}
+		if (expo.length > 0) {
+			fields.push({ label: '曝光', value: expo, full: false } as InfoField)
+		}
+
+		if (d.filePath.length > 0) {
+			fields.push({ label: '路径', value: d.filePath, full: true } as InfoField)
+		}
+
+		// 位置：地址名（geo）优先，后面带坐标
+		let place = d.geo
+		if (d.latitude != 0 || d.longitude != 0) {
+			const coord = d.latitude.toString() + ', ' + d.longitude.toString()
+			place = place.length > 0 ? (place + ' · ' + coord) : coord
+		}
+		if (place.length > 0) {
+			fields.push({ label: '位置', value: place, full: true } as InfoField)
+		}
+
+		if (d.description.length > 0) {
+			fields.push({ label: '描述', value: d.description, full: true } as InfoField)
+		}
+
+		fields.push({ label: '类型', value: p.cat == 'video' ? '视频' : '照片', full: false } as InfoField)
+		fields.push({ label: 'ID', value: p.id, full: false } as InfoField)
+		infoFields.value = fields
+
+		// 人物（可能多个，左栏横向排列并自动换行）
+		const persons: Array<PersonView> = []
+		for (let i = 0; i < d.persons.length; i++) {
+			const person = d.persons[i]
+			persons.push({
+				name: person.name,
+				initial: person.name.length > 0 ? person.name.substring(0, 1) : '?',
+				path: person.avatar,
+				src: ''
+			} as PersonView)
+		}
+		infoPersons.value = persons
+		for (let i = 0; i < persons.length; i++) {
+			fillPersonAvatar(i, seq)
+		}
+
+		// 相册（可能多个）
+		const albums: Array<AlbumView> = []
+		for (let i = 0; i < d.albums.length; i++) {
+			const a = d.albums[i]
+			let sub = a.month
+			if (a.count > 0) {
+				sub = sub.length > 0 ? (sub + ' · ' + a.count.toString() + ' 项') : (a.count.toString() + ' 项')
+			}
+			if (a.shared) {
+				sub = sub.length > 0 ? (sub + ' · 已共享') : '已共享'
+			}
+			albums.push({ name: a.name, sub: sub, path: a.cover, src: '' } as AlbumView)
+		}
+		infoAlbums.value = albums
+		for (let i = 0; i < albums.length; i++) {
+			fillAlbumCover(i, seq)
+		}
+	}
+
+	/** 停留 200ms 才请求详情：快速连切时不会把一堆 getOne 排进队列 */
+	function scheduleDetail(p: PhotoItem, seq: number) {
+		setTimeout(() => {
+			if (seq != viewerSeq || !alive) {
+				return
+			}
+			loadDetail(p, seq)
+		}, 200)
+	}
+
+	function toggleViewerInfo() {
+		viewerInfo.value = !viewerInfo.value
+	}
+
+	// ---------------- 实况片段 ----------------
+
+	function liveClass(): string {
+		return liveReady.value ? 'vw-live' : 'vw-live vw-live-idle'
+	}
+
+	/** 当前这张照片能不能播实况片段（视频文件不做实况，视频播放是另一套） */
+	function canReplayLive(): boolean {
+		const p = currentPhoto()
+		if (p == null) {
+			return false
+		}
+		return p.cat != 'video' && p.live && p.video.length > 0
+	}
+
+	/** 卸掉 <video>，回到静态图 */
+	function stopLive() {
+		liveSeq = liveSeq + 1
+		livePlaying.value = false
+		liveSrc.value = ''
+		liveReady.value = false
+	}
+
+	/**
+	 * 播实况片段。
+	 *
+	 * 先停掉上一张、清空 src，下载（或命中缓存）后再设新 src，
+	 * 并用 liveKey 强制重建 <video>：只给同一个 src 重复赋值不会让进度归零。
+	 */
+	async function playLive(p: PhotoItem, muted: boolean) {
+		if (p.video.length == 0) {
+			return
+		}
+		liveSeq = liveSeq + 1
+		const seq = liveSeq
+		liveTriedFile = false
+		liveStarted = false
+		liveReady.value = false
+		livePlaying.value = false
+		liveSrc.value = ''
+		liveMuted.value = muted
+		const local = await video(p.video)
+		if (seq != liveSeq || !alive) {
+			return
+		}
+		if (local.length == 0) {
+			return
+		}
+		liveSrc.value = local
+		liveKey.value = liveKey.value + 1
+		livePlaying.value = true
+		// #ifdef WEB
+		// 浏览器策略：没有用户手势时不允许有声自动播放。700ms 内没收到 @play 就改静音重来一次
+		setTimeout(() => {
+			if (seq != liveSeq || !livePlaying.value || liveStarted) {
+				return
+			}
+			liveMuted.value = true
+			liveKey.value = liveKey.value + 1
+		}, 700)
+		// #endif
+	}
+
+	/** <video> 真的开始播了：标记浏览器放行，并把 video 从透明切成可见 */
+	function onLivePlay() {
+		appLog('[live] event play')
+		liveStarted = true
+		liveReady.value = true
+	}
+
+	/**
+	 * 实况片段的兜底显形。
+	 *
+	 * 现象（真机反馈）：看实况照片「只有声音、画面不动」—— 静态图看得见、声音在响，
+	 * 但 `<video>` 一直是 `vw-live-idle`（opacity:0）。原因是「露出视频」只挂在 `@play` 上，
+	 * 有些盒子/有些 ROM 只回 `@timeupdate` 不回 `@play`，于是永远不显形。
+	 * 只要开始出时间戳就说明播放器在跑，直接露出来。
+	 */
+	function onLiveTime(e: UniVideoTimeUpdateEvent) {
+		if (!liveReady.value) {
+			appLog('[live] first timeupdate t=' + e.detail.currentTime.toString())
+			liveReady.value = true
+		}
+	}
+
+	function onLiveEnded() {
+		stopLive()
+	}
+
+	/**
+	 * 片段放不出来（服务端没给 videoUrl、编码不支持、路径前缀不对）：
+	 * App 端先补一次 file:// 重试，仍失败就静默退回图片 —— 照片本体照常看。
+	 */
+	function onLiveError(e: UniVideoErrorEvent) {
+		appLog('[live] event error ' + e.detail.errMsg)
+		// #ifdef APP-ANDROID
+		if (!liveTriedFile && liveSrc.value.length > 0 && !liveSrc.value.startsWith('file://')) {
+			liveTriedFile = true
+			liveSrc.value = 'file://' + liveSrc.value
+			liveKey.value = liveKey.value + 1
+			return
+		}
+		// #endif
+		stopLive()
+	}
+
+	/** 重播：遥控器 OK 键与浏览器右上角播放按钮都走这里 */
+	function replayLive() {
+		const p = currentPhoto()
+		if (p == null) {
+			return
+		}
+		playLive(p, false)
+	}
+
+	// ---------------- 视频播放器 ----------------
+
+	/** 当前查看项是不是视频文件（视频与实况互斥） */
+	function viewerIsVideo(): boolean {
+		const p = currentPhoto()
+		return p != null && p.cat == 'video'
+	}
+
+	/** 秒 → mm:ss */
+	function clockText(sec: number): string {
+		let s = Math.floor(sec)
+		if (s < 0) {
+			s = 0
+		}
+		const m = Math.floor(s / 60)
+		const r = s % 60
+		const rs = r < 10 ? ('0' + r.toString()) : r.toString()
+		return m.toString() + ':' + rs
+	}
+
+	/** 状态条上的「当前 / 总时长」，用 computed 而不是在模板里传 ref，避免两端解包差异 */
+	const videoPosText = computed((): string => clockText(videoPos.value))
+	const videoDurText = computed((): string => clockText(videoDur.value))
+
+	/** 进度条填充宽度（内联 rpx，随 videoPos / videoDur 变化） */
+	const videoFillStyle = computed((): string => {
+		const d = videoDur.value
+		let pct = 0.0
+		if (d > 0.0) {
+			pct = videoPos.value / d
+		}
+		if (pct < 0.0) {
+			pct = 0.0
+		}
+		if (pct > 1.0) {
+			pct = 1.0
+		}
+		const w = Math.round(VP_TRACK_RPX * pct * 10.0) / 10.0
+		return 'width:' + w.toString() + 'rpx;'
+	})
+
+	/**
+	 * 视频是否「可操作」（能快进/暂停）。
+	 * 地址缺失或解码失败时为 false：左右键与两侧热区恢复成切图，OK 恢复成关闭。
+	 */
+	function videoSeekable(): boolean {
+		if (!viewerIsVideo()) {
+			return false
+		}
+		return !(videoError.value.length > 0 && !videoPreparing.value)
+	}
+
+	/** 提示的公共实现：连按会重置计时器 */
+	function setVideoHint(text: string, ms: number) {
+		videoHint.value = text
+		if (videoHintTimer > 0) {
+			clearTimeout(videoHintTimer)
+		}
+		videoHintTimer = setTimeout(() => {
+			videoHintTimer = 0
+			videoHint.value = ''
+		}, ms)
+	}
+
+	/** 短暂提示，900ms 后清掉 */
+	function flashVideoHint(text: string) {
+		setVideoHint(text, 900)
+	}
+
+	/**
+	 * 重要提示，显示 6 秒。
+	 * 只用在「你以为设置生效了、其实回退成原画」这类地方：一闪而过的 900ms 提示
+	 * 会让用户以为几个档位没区别（T4.6 实测反馈）。
+	 */
+	function noticeVideoHint(text: string) {
+		setVideoHint(text, 6000)
+	}
+
+	/** 懒取播放器上下文：<video> 刚挂载那一下可能还取不到，下次调用自然会补上 */
+	function videoContext(): VideoContext | null {
+		let ctx = videoCtx
+		if (ctx == null && videoSrc.value.length > 0) {
+			// uni-app x 在**组件内部**用 `createVideoContext(id)` 有几率拿到的不是 video 元素
+			// （2026-11-24 真机日志：`UniElementImpl cannot be cast to UniVideoElement`，抛在
+			// DCloudUniVideo 的 lambda 里），不接住就会中断整段启动逻辑。
+			// 这里兜住：拿不到上下文就算了 —— 播放由 `<video :autoplay>` 自己驱动，
+			// 上下文只用于 play/pause/seek，没有也能播。
+			try {
+				ctx = uni.createVideoContext(videoElId.value)
+			} catch (e) {
+				ctx = null
+			}
+			videoCtx = ctx
+			// 诊断：元素到底在不在元素树里（null = 元素没渲染出来；非 null 但 ctx 为空 =
+			// 元素是通用节点，原生播放视图没建）
+			let elTag = 'null'
+			try {
+				const el = uni.getElementById(videoElId.value)
+				if (el != null) {
+					elTag = 'found'
+				}
+			} catch (e) {
+				elTag = 'throw'
+			}
+			appLog('[v] el=' + elTag + ' ctx=' + (ctx == null ? 'null' : 'ok'))
+		}
+		return ctx
+	}
+
+	/** 倍速文案：1.0x / 1.5x / 2x（与 web 端一致） */
+	function videoRateText(): string {
+		const r = VIDEO_RATES[videoRateIndex.value]
+		const whole = Math.floor(r)
+		if (whole == r) {
+			return (r == 1.0 ? '1.0x' : whole.toString() + 'x')
+		}
+		return r.toString() + 'x'
+	}
+
+	/**
+	 * 状态行末尾的画质说明：`· 原画` / `· 标清 720p/5000k`。
+	 * 用户反馈「几个档位看不出区别」时先看这一行 —— 它显示的是**实际在播的那条流**。
+	 * `videoChosenRes` 现在自带 `p` 与码率（如 `360p/500k`），别再补 `p`。
+	 */
+	function videoQualitySuffix(): string {
+		if (videoQualityShown.value.length == 0) {
+			return ''
+		}
+		if (videoChosenRes.value.length > 0) {
+			return ' · ' + videoQualityShown.value + ' ' + videoChosenRes.value
+		}
+		return ' · ' + videoQualityShown.value
+	}
+
+	/** 状态行文案：临时提示优先，其次才是常规状态 */
+	function videoStateText(): string {
+		if (videoHint.value.length > 0) {
+			return videoHint.value
+		}
+		if (videoTranscoding.value) {
+			return '转码中…（' + videoQualityShown.value + '）'
+		}
+		if (videoPreparing.value) {
+			return '正在准备视频…'
+		}
+		if (videoError.value.length > 0) {
+			return videoError.value
+		}
+		if (!videoStarted.value) {
+			// 转码档位按下 OK 后要先等 NAS 转码，提示里带上档位，免得以为卡住了
+			if (videoNeedTranscode) {
+				return '按 OK 开始播放（' + videoQualityShown.value + '）'
+			}
+			return '按 OK 开始播放'
+		}
+		if (videoEnded.value) {
+			return '已结束 · OK 重播'
+		}
+		if (videoPlaying.value) {
+			return '播放中' + videoQualitySuffix()
+		}
+		return '已暂停' + videoQualitySuffix()
+	}
+
+
+	// ---------------- 清晰度（设置页的档位，T4.6） ----------------
+
+	/** 读用户设置的档位；没存过 / 非法值回落默认（标清），读取端按枚举比较（AGENTS 5.2） */
+	function readVideoQuality(): string {
+		const raw = uni.getStorageSync(VIDEO_QUALITY_KEY)
+		return normalizeVideoQuality(raw == null ? '' : raw.toString())
+	}
+
+	/** 读 HEVC 兼容开关（T4.8）；只有明确存了 `on` 才算开启，其它一律关闭 */
+	function readHevcCompat(): boolean {
+		const raw = uni.getStorageSync(VIDEO_HEVC_KEY)
+		return isHevcCompatOn(raw == null ? '' : raw.toString())
+	}
+
+	/**
+	 * HEVC 兜底转码的目标分辨率（短边像素）：取源视频的短边，尽量保留原画质。
+	 * 列表里没有宽高时退回 720（与标清一致）。真正可用的档位仍由 `decode/info` 的 quality[] 决定。
+	 */
+	function sourceTargetHeight(p: PhotoItem): number {
+		if (p.w > 0 && p.h > 0) {
+			return p.w < p.h ? p.w : p.h
+		}
+		return 720
+	}
+
+	/**
+	 * 源视频短边（「NAS转码原画」的目标分辨率）。
+	 *
+	 * 优先用 `decode/info` 的 `videoStreamInfo[0]`（最准，含竖屏旋转前的帧尺寸），
+	 * 拿不到才退回列表里的 `p.w / p.h`，再没有就 0（由 `videoQualityTargetHeight` 按 4K 兜底）。
+	 */
+	function sourceShortSide(p: PhotoItem, infoW: number, infoH: number): number {
+		if (infoW > 0 && infoH > 0) {
+			return infoW < infoH ? infoW : infoH
+		}
+		if (p.w > 0 && p.h > 0) {
+			return p.w < p.h ? p.w : p.h
+		}
+		return 0
+	}
+
+	function clearTranscodeTimer() {
+		if (videoTranscodeTimer > 0) {
+			clearTimeout(videoTranscodeTimer)
+			videoTranscodeTimer = 0
+		}
+	}
+
+	/**
+	 * 需要给 `<video>` 补的旋转角度（0 / 90 / 180 / 270）。
+	 *
+	 * NAS 用 FFmpeg 约定（竖屏是 `-90`），而 mp4 容器矩阵 / ExoPlayer 用的是正向角度
+	 * （同一支视频 media.metrics 里是 `rotation-degrees=90`），所以这里取反再归一化。
+	 */
+	function videoRotateDeg(): number {
+		const raw = videoSourceRotation.value
+		if (raw == 0) {
+			return 0
+		}
+		const deg = ((-raw % 360) + 360) % 360
+		if (deg == 90 || deg == 180 || deg == 270) {
+			return deg
+		}
+		return 0
+	}
+
+	/**
+	 * 转码竖屏视频时，把 `<video>` 的盒子换成「旋转前的横盒」，再整体转 90°：
+	 *
+	 * `vw-stage` 是整屏（如 1920×1080），竖屏画面只能占中间 9:16 的一块。
+	 * 直接把整屏盒子转 90° 会把画面裁掉上下，所以盒子按**屏高**定宽、
+	 * 按源视频宽高比定高（16:9 源 → 1080×607），转完正好是 607×1080 的竖屏画面。
+	 *
+	 * 只有「转码流 + 旋转 90/270 + 知道源宽高」三者同时成立才动样式；
+	 * 原画是 mp4，ExoPlayer 自己会转，绝不能再转一次。
+	 */
+	function updateVideoBoxStyle() {
+		const deg = videoRotateDeg()
+		const w = videoSourceWidth.value
+		const h = videoSourceHeight.value
+		if (!videoTranscodeOn.value || (deg != 90 && deg != 270) || w <= 0 || h <= 0) {
+			videoBoxStyle.value = ''
+			return
+		}
+		const win = uni.getWindowInfo()
+		const stageW = win.windowWidth
+		const stageH = win.windowHeight
+		if (stageW <= 0 || stageH <= 0) {
+			videoBoxStyle.value = ''
+			return
+		}
+		// 旋转前的盒子：宽 = 屏高，高 = 屏高 × 源高/源宽（16:9 源 → 607）
+		const boxW = stageH
+		const boxH = stageH * h / w
+		const left = (stageW - boxW) / 2.0
+		const top = (stageH - boxH) / 2.0
+		videoBoxStyle.value = 'left:' + left.toString() + 'px;top:' + top.toString() +
+			'px;width:' + boxW.toString() + 'px;height:' + boxH.toString() +
+			'px;transform:rotate(' + deg.toString() + 'deg);'
+	}
+
+	/** 每次换片 / 换播放方式都重置，避免上一支竖屏视频的角度留在下一支上 */
+	function resetVideoRotation() {
+		videoSourceRotation.value = 0
+		videoSourceWidth.value = 0
+		videoSourceHeight.value = 0
+		videoBoxStyle.value = ''
+	}
+
+	/** 截断过长的错误文案：ExoPlayer 的 errMsg 可能上百字符，状态行放不下 */
+	function shortText(text: string, max: number): string {
+		if (text.length <= max) {
+			return text
+		}
+		return text.substring(0, max) + '…'
+	}
+
+	/**
+	 * 播放失败时的排障后缀：`｜代理｜头=有`。
+	 * - `代理` = 地址是本机回环代理（App 端唯一能带鉴权的播法，见 5.19）；
+	 * - `直链` = 直接连 NAS，必然 401；
+	 * - `头=` 是 `<video :header>` 有没有拿到 token（**实测这个头进不到 ExoPlayer**）。
+	 */
+	function videoDebugSuffix(): string {
+		const src = videoSrc.value
+		const viaProxy = src.indexOf('127.0.0.1') >= 0
+		return '｜' + (viaProxy ? '代理' : '直链') + '｜头=' + (videoHeaderOk.value ? '有' : '无')
+	}
+
+	/**
+	 * 「要不要显示转圈」只看状态，不看谁记得停。
+	 *
+	 * 这套代码前两版都栽在「定时器归属」上：真机日志出现过秒数累计到 190s 还在跑
+	 * （某个路径把 videoBuffering 置 false 却没停表）。现在改成**一个常驻 tick**
+	 * （查看器打开期间每 500ms 一次），每次只看两个布尔状态：
+	 *   need = 已挂载 && 没出错 && (等首帧 || 缓冲中)
+	 * need 为真就转圈+累加秒数，为假就归零。**没有任何地方需要 start/stop 它**，
+	 * 组件销毁时在 onUnmounted 收一次即可 —— 结构上不可能再泄漏。
+	 */
+	let spinTimer = 0
+	/** 重播重建 <video> 的次数（拼进元素 id） */
+	let videoRebuildSeq = 0
+	/** 本轮「需要转圈」的起始时间；0 表示当前不需要 */
+	let spinnerSince = 0
+
+	function spinnerNeeded(): boolean {
+		if (!videoStarted.value || videoError.value.length > 0) {
+			return false
+		}
+		// 播完之后不该再转圈：真机反馈「卡的时候没出现，播完却出现了」——
+		// 原因是片尾也会来 waiting（把 videoBuffering 置真），而结束后不再有 timeupdate 去清它。
+		if (videoEnded.value) {
+			return false
+		}
+		// 更要紧的一条：这支 4K 原画播到结尾时播放器**根本不发 @ended**，
+		// 而是停在 末位/时长 上一直报 buffering（真机日志 spinner 125s buffering=true）。
+		// 所以「位置已经到头」也直接当播完处理，否则转圈会一直挂着。
+		if (videoDur.value > 0.0 && videoPos.value >= videoDur.value - 1.0) {
+			return false
+		}
+		// 暂停时同理；但「等首帧」阶段 videoPlaying 已经是乐观的 true，不受影响
+		if (!videoPlaying.value && !videoFirstFrame.value) {
+			return false
+		}
+		return videoFirstFrame.value || videoBuffering.value
+	}
+
+	function spinnerTick() {
+		if (!alive) {
+			if (spinTimer > 0) {
+				clearInterval(spinTimer)
+				spinTimer = 0
+			}
+			return
+		}
+		if (!spinnerNeeded()) {
+			if (spinnerSince != 0) {
+				spinnerSince = 0
+				bufferSeconds.value = 0
+				spinAngle.value = 0
+			}
+			return
+		}
+		if (spinnerSince == 0) {
+			spinnerSince = Date.now()
+			bufferSeconds.value = 0
+		}
+		spinAngle.value = (spinAngle.value + 60) % 360
+		const sec = Math.floor((Date.now() - spinnerSince) / 1000.0)
+		if (sec != bufferSeconds.value) {
+			bufferSeconds.value = sec
+			// 诊断：每 5 秒一条，确认秒数真的在累计
+			if (sec > 0 && sec % 5 == 0) {
+				appLog('[v] spinner ' + sec.toString() + 's firstFrame=' +
+					videoFirstFrame.value.toString() + ' buffering=' + videoBuffering.value.toString())
+			}
+		}
+	}
+
+	function armSpinnerTick() {
+		if (spinTimer > 0) {
+			return
+		}
+		spinTimer = setInterval(() => {
+			spinnerTick()
+		}, 500)
+	}
+
+	function stopSpinnerTick() {
+		if (spinTimer > 0) {
+			clearInterval(spinTimer)
+			spinTimer = 0
+		}
+		spinnerSince = 0
+		bufferSeconds.value = 0
+		spinAngle.value = 0
+	}
+
+	/** 统一收状态：任何「出画面 / 暂停 / 播完 / 失败 / 关闭」都走它 */
+	function stopSpinner() {
+		videoFirstFrame.value = false
+		videoBuffering.value = false
+	}
+
+	/** 换片 / 重新开始播放：位置基线必须清掉，否则新视频会拿旧位置比 */
+	function resetProgressBase() {
+		lastPosSeen = -1.0
+		lastProgressAt = Date.now()
+	}
+
+	/**
+	 * 卡顿看门狗：播放中每 500ms 看一次「距离上次 timeupdate 多久」。
+	 *
+	 * 为什么不能只靠 waiting：真机上几次卡顿期间 waiting 并没有来
+	 * （ExoPlayer 停顿时不一定发 waiting），只能靠进度空档判断；
+	 * 顺带把「解码跟不上」也算进去 —— 对用户来说两者都是「画面不动」。
+	 */
+	function startStallWatch() {
+		if (stallTimer > 0) {
+			return
+		}
+		lastProgressAt = Date.now()
+		stallTimer = setInterval(() => {
+			if (!alive) {
+				clearInterval(stallTimer)
+				stallTimer = 0
+				return
+			}
+			if (!videoStarted.value || !videoPlaying.value) {
+				return
+			}
+			const gap = Date.now() - lastProgressAt
+			// 片尾收尾：真机实测这支 31s 的视频走到 30.4s 就停住，播放器既不再请求数据、
+			// 也不发 @ended（日志 spinner 一路跑到 125s）；文件其实早就下完了 ——
+			// 代理的 Range 响应是完整的（尾部 Content-Range 242963871-244120353/244120354，一字节不缺）。
+			// 这是 ExoPlayer 对渐进式源的收尾问题，改不了它，就在这层兜：
+			// 位置已经贴到片尾且停住超过 2.5s → 直接当播完（UI 走 ended 那套，OK 可重播）。
+			if (gap > 2500.0 && videoDur.value > 0.0 && (videoDur.value - videoPos.value) < 1.5) {
+				videoEnded.value = true
+				videoPos.value = videoDur.value
+				videoBuffering.value = false
+				videoFirstFrame.value = false
+				appLog('[v] settle at end pos=' + videoPos.value.toString() +
+					' dur=' + videoDur.value.toString())
+				clearInterval(stallTimer)
+				stallTimer = 0
+				return
+			}
+			videoBuffering.value = gap > 1500.0
+		}, 500)
+	}
+
+	function stopStallWatch() {
+		if (stallTimer > 0) {
+			clearInterval(stallTimer)
+			stallTimer = 0
+		}
+	}
+
+	/** 首帧还没出来：只改状态，转圈由常驻 tick 负责 */
+	function markFirstFrameWait() {
+		// 异步回填（下载兜底 / 转码回调）可能在组件销毁之后才走到这里
+		if (!alive) {
+			return
+		}
+		videoFirstFrame.value = true
+	}
+
+	/** 彻底放不出来：卸载 <video>、把原因写到状态行（OK 仍可关闭查看器） */
+	function videoFail(why: string) {
+		videoSrc.value = ''
+		videoCtx = null
+		videoStarted.value = false
+		videoPlaying.value = false
+		videoPreparing.value = false
+		stopSpinner()
+		stopStallWatch()
+		videoError.value = '播放失败：' + why + videoDebugSuffix()
+		appLog('[v] fail ' + why)
+	}
+
+	function clearVideoWatch() {
+		if (videoWatchTimer != 0) {
+			clearTimeout(videoWatchTimer)
+			videoWatchTimer = 0
+		}
+	}
+
+
+	/**
+	 * 把地址交给 `<video>`。
+	 *
+	 * 2026-11-24 真机定位到的关键点：`v-if` + 同一拍内改 `src` + 改 `:key` 时，
+	 * VDOM 会把 video 元素建出来，但底下那个原生播放视图没建（`createVideoContext`
+	 * 拿到的还是通用 `UniElementImpl`，被 `UniVideoElement` 强转失败），
+	 * 表现就是「进度条/状态行都在，画面全黑，代理一条请求都没收到」。
+	 * 所以 `<video>` 改成「进查看器就挂上（此时无源）」、源只作为属性更新，不再重建元素。
+	 */
+	function deliverSource(url: string, pos: number, autoplay: boolean) {
+		videoStartPos.value = pos
+		videoAutoplay.value = autoplay
+		videoPos.value = pos
+		videoEnded.value = false
+		videoCtx = null
+		videoSrc.value = url
+		appLog('[v] src len=' + url.length)
+		markFirstFrameWait()
+		setTimeout(() => {
+			if (!alive) {
+				return
+			}
+			const ctx = videoContext()
+			appLog('[v] ctx ' + (ctx == null ? 'null' : 'ok'))
+			if (ctx != null && videoPlaying.value) {
+				ctx.play()
+			}
+		}, 300)
+	}
+
+	/** 换源重挂 <video>（重播 / 直链失败回退下载共用） */
+	function mountVideoStream(url: string, pos: number, autoplay: boolean) {
+		appLog('[v] mount autoplay=' + autoplay + ' started=' + videoStarted.value +
+			' pos=' + pos + ' urlLen=' + url.length)
+		videoStartPos.value = pos
+		videoAutoplay.value = autoplay
+		videoPos.value = pos
+		videoEnded.value = false
+		videoCtx = null
+		if (!videoStarted.value) {
+			// 还没按过 OK：只换地址，保持「按 OK 开始播放」
+			videoSrc.value = url
+			return
+		}
+		deliverSource(url, pos, autoplay)
+	}
+
+	/**
+	 * 最后一级兜底：把原文件下载到本地再播（插件自带 token，取字节必定成功）。
+	 *
+	 * 它只解决网络 / 直链问题，**编码没变**：HEVC 源下载下来照样放不出画面，
+	 * 所以 T4.8 在它之前插了一级「服务端转 H.264」（见 `hevcFallbackFailed` 与 `onVideoError`）。
+	 */
+	async function fallbackDownload(why: string) {
+		const p = currentPhoto()
+		if (p == null || p.video.length == 0) {
+			videoFail(why)
+			return
+		}
+		videoFallbackTried = true
+		const seq = videoSeq
+		const pos = videoPos.value
+		const wasPlaying = videoPlaying.value || !videoStarted.value
+		videoPreparing.value = true
+		appLog('[v] download fallback: ' + why)
+		const local = await video(p.video)
+		if (seq != videoSeq || !alive) {
+			return
+		}
+		videoPreparing.value = false
+		appLog('[v] download done len=' + local.length)
+		if (local.length > 0) {
+			// 播的是下载回本地的原文件 → 状态行如实显示「原画」
+			videoTranscodeOn.value = false
+			resetVideoRotation()
+			videoQualityShown.value = '原画'
+			videoChosenRes.value = ''
+			mountVideoStream(local, pos, wasPlaying)
+			return
+		}
+		videoFail(why)
+	}
+
+	/**
+	 * 「按了 OK、播放器也报开始播了，但一直没有进度」的看门狗。
+	 *
+	 * 2026-11-24 真机实测：原画视频黑屏、状态行写着「播放中 · 原画」、进度 `0:00 / 0:00`，
+	 * **既不报错也放不出来**（播放器拿到 `@play` 却没数据），用户只能反复按 OK。
+	 * 这里在真正开始播之后等 8 秒：还没有任何进度/时长，就当作「流打不开」，
+	 * 直接走已有的下载兜底（把原文件拉到本地再播）；兜底也失败才显示明确错误。
+	 */
+	function armVideoWatch() {
+		clearVideoWatch()
+		appLog('[v] watch arm')
+		videoWatchTimer = setTimeout(() => {
+			videoWatchTimer = 0
+			if (!alive || !videoStarted.value) {
+				return
+			}
+			// 有进度、或者已经拿到时长：说明流是通的，正常播放
+			if (videoPos.value > 0.2 || videoDur.value > 0.2) {
+				return
+			}
+			appLog('[v] watch fired pos=' + videoPos.value + ' dur=' + videoDur.value +
+				' tried=' + videoFallbackTried)
+			if (videoFallbackTried) {
+				videoFail('视频加载不出来（已尝试下载到本地）')
+				return
+			}
+			fallbackDownload('加载超时（8 秒无进度）')
+		}, 8000)
+	}
+
+	/** 按 OK 首次开始：这时才挂载 <video>（进入查看器不自动播） */
+	function startVideo() {
+		const url = videoSrc.value
+		videoAutoplay.value = true
+		videoPlaying.value = true
+		// 一拍完成：src / autoplay 都已就绪时再让 v-if 把元素建出来，
+		// 让原生播放器在创建的那一刻就带着源和 autoplay（属性后改在 VDOM 下不生效）
+		videoStartPos.value = 0.0
+		videoPos.value = 0.0
+		videoEnded.value = false
+		videoCtx = null
+		videoStarted.value = true
+		appLog('[v] startVideo srcLen=' + url.length + ' transcode=' + videoTranscodeOn.value)
+		// 从这一刻到出第一帧之间也转圈（原画 4K 实测能等 8 秒）
+		resetProgressBase()
+		markFirstFrameWait()
+		setTimeout(() => {
+			if (!alive) {
+				return
+			}
+			const ctx = videoContext()
+			if (ctx != null && videoPlaying.value) {
+				ctx.play()
+			}
+		}, 300)
+		// 不等 @play：真机见过播放器不报事件也不出画面，这里直接上秒表
+		armVideoWatch()
+	}
+
+
+	/**
+	 * HEVC 兜底转码没成功（NAS 拒绝 / 没有可转档位 / 超时）：如实说「编码不支持」，
+	 * 然后直接去下载原文件 —— 不再回原画，因为原画刚刚才证明放不出来。
+	 */
+	function hevcFallbackFailed(text: string) {
+		videoTranscodeSeq = videoTranscodeSeq + 1
+		clearTranscodeTimer()
+		videoPreparing.value = false
+		videoTranscoding.value = false
+		videoTranscodeOn.value = false
+		// 没有在转码了：状态行别再挂着「H.264兼容 xxxxp」
+		videoQualityShown.value = '原画'
+		videoChosenRes.value = ''
+		videoTriedDirectFallback = true
+		noticeVideoHint(text)
+		fallbackDownload(text)
+	}
+
+	/**
+	 * 转码不可用（没有档位 / 接口失败 / 超时）：退回原画直链。
+	 * 只是画质不如设置，不能把视频变成放不了，所以只提示一行、不报错。
+	 */
+	function fallbackOriginal(hint: string) {
+		// 作废在途的转码请求：超时回退之后，迟迟返回的 videoPlay 不能再把地址盖回 HLS
+		videoTranscodeSeq = videoTranscodeSeq + 1
+		clearTranscodeTimer()
+		videoPreparing.value = false
+		videoTranscoding.value = false
+		videoTranscodeOn.value = false
+		// 回原画了：ExoPlayer 会按 mp4 的旋转矩阵自己转，客户端补的 90° 必须撤掉
+		resetVideoRotation()
+		// 已经改走直链了，后面按 OK 别再重新申请转码
+		videoNeedTranscode = false
+		// 已经回退过原画了：原画再失败就直接走「下载到本地再播」，不要又回退一次
+		videoTriedDirectFallback = true
+		// 状态行从此显示「原画」：用户一眼就能看出档位没生效（不是「看不出区别」）
+		videoQualityShown.value = '原画'
+		videoChosenRes.value = ''
+		noticeVideoHint(hint)
+		const p = currentPhoto()
+		if (p == null || p.video.length == 0) {
+			videoError.value = '该视频没有可播放地址'
+			videoPendingStart = false
+			return
+		}
+		videoSrc.value = mediaUrl(p.video)
+		if (videoPendingStart) {
+			videoPendingStart = false
+			startVideo()
+		}
+	}
+
+	/**
+	 * 准备转码流：`decode/info` 挑档 → `decode/play` 申请 HLS 地址（`decode/stream` + playLink）。
+	 *
+	 * 两种用途：
+	 *   1. 用户选的清晰度是标清 / 低清（`hevcFallback = false`）：按档位挑档，就绪后按用户是否按过 OK 开播；
+	 *   2. **HEVC 兜底**（`hevcFallback = true`，T4.8）：原画放不出来时让 NAS 转一份 H.264，
+	 *      目标分辨率取源视频短边，并用 `startPosition` 从当前进度续播。
+	 *      失败就直说「该视频编码不支持」并转「下载到本地再播」，不再回原画（回原画必然再错一次）。
+	 *
+	 * 播放地址是**临时的**，只给 `<video>` 用，不进 `video()` 的磁盘缓存（AGENTS T4.6）。
+	 * 转码期间状态行显示「转码中…」，超过 TRANSCODE_TIMEOUT_MS 放弃并回退。
+	 */
+	async function prepareTranscode(p: PhotoItem, quality: string, hevcFallback: boolean) {
+		videoTranscodeSeq = videoTranscodeSeq + 1
+		const seq = videoTranscodeSeq
+		// 这个视频已经试过服务端转码：@error 里的 HEVC 兜底不许再申请一次（每级只试一次）
+		videoTriedHevcTranscode = true
+		/** HEVC 兜底要续播的进度（申请转码时作为 startPosition 发出）；清晰度档位恒为 0 */
+		const resumePos = hevcFallback ? videoPos.value : 0.0
+		if (hevcFallback) {
+			videoQualityShown.value = VIDEO_HEVC_LABEL
+			videoChosenRes.value = ''
+		}
+		videoPreparing.value = true
+		videoTranscoding.value = true
+		videoError.value = ''
+		appLog('[v] transcode ask quality=' + quality + ' hevc=' + hevcFallback +
+			' id=' + p.id)
+		clearTranscodeTimer()
+		videoTranscodeTimer = setTimeout(() => {
+			videoTranscodeTimer = 0
+			if (seq != videoTranscodeSeq || !alive) {
+				return
+			}
+			if (hevcFallback) {
+				hevcFallbackFailed('转码超时，该视频编码不支持')
+			} else {
+				fallbackOriginal('转码超时，已用原画播放')
+			}
+		}, TRANSCODE_TIMEOUT_MS)
+
+		const info = await videoInfo(p.id)
+		if (seq != videoTranscodeSeq || !alive) {
+			return
+		}
+		// 在 quality[] 里挑档：原始画质那一项**没有 bitrate**（见 AGENTS 5.11），跳过。
+		//
+		// 六档（2026-11-24 用户确定，见 common/video.uts）分两类打法：
+		//   · 「低清」不看分辨率，直接取全局码率最小的那档（360p/200k 左右）；
+		//   · 「标清」= 最接近 720 的分辨率 + 该分辨率里码率**最小**的一档（约 1000k）；
+		//     早期版本取的是 720 的第一个命中项 = 5000k，实测「跟原画太接近」（用户反馈）。
+		//   · 「NAS转码原画 / 2.5K / 1080P」= 最接近目标的分辨率 + 该分辨率里码率**最大但不超过上限**
+		//     的一档（上限见 `videoQualityBitrateCap`）：不封顶就等于换个方式播原画，照样卡。
+		// 分辨率要按 `resolutionHeight` 折算（`4k` → 2160），不能 parseInt——`parseInt("4k")` 是 4。
+		const list = info.qualities
+		const sourceShort = sourceShortSide(p, info.sourceWidth, info.sourceHeight)
+		const target = hevcFallback
+			? sourceTargetHeight(p)
+			: videoQualityTargetHeight(quality, sourceShort)
+		const wantLow = !hevcFallback && quality == VIDEO_QUALITY_LOW
+		const cap = hevcFallback ? 0 : videoQualityBitrateCap(quality)
+		// 第一遍：最接近目标分辨率的高度 + 全局最小码率
+		let bestDiff = 0.0
+		let bestHeight = 0
+		let lowIndex = -1
+		let lowBitrate = 0.0
+		for (let i = 0; i < list.length; i++) {
+			const q = list[i]
+			if (q.bitrate <= 0) {
+				continue
+			}
+			const height = resolutionHeight(q.resolution)
+			// 折算失败是 NaN（与任何数比较都是 false），反向判断正好把它排除掉
+			if (!(height > 0)) {
+				continue
+			}
+			if (lowIndex < 0 || q.bitrate < lowBitrate ||
+				(q.bitrate == lowBitrate && height < resolutionHeight(list[lowIndex].resolution))) {
+				lowIndex = i
+				lowBitrate = q.bitrate
+			}
+			const diff = Math.abs(height - target)
+			if (bestHeight == 0 || diff < bestDiff || (diff == bestDiff && height > bestHeight)) {
+				bestDiff = diff
+				bestHeight = height
+			}
+		}
+		// 第二遍：在选中的分辨率里挑码率
+		//   cap > 0 → 取「不超过上限里最大的」；没有低于上限的就取最小的（NAS 的档位都比上限高）
+		//   cap = 0 → 取最小的（标清 / 低清 / HEVC 兜底的既有行为）
+		let fitIndex = -1
+		let fitBitrate = 0.0
+		if (bestHeight > 0) {
+			for (let i = 0; i < list.length; i++) {
+				const q = list[i]
+				if (q.bitrate <= 0) {
+					continue
+				}
+				if (resolutionHeight(q.resolution) != bestHeight) {
+					continue
+				}
+				if (cap <= 0) {
+					if (fitIndex < 0 || q.bitrate < fitBitrate) {
+						fitIndex = i
+						fitBitrate = q.bitrate
+					}
+					continue
+				}
+				if (q.bitrate <= cap) {
+					if (fitIndex < 0 || q.bitrate > fitBitrate) {
+						fitIndex = i
+						fitBitrate = q.bitrate
+					}
+				}
+			}
+			if (fitIndex < 0 && cap > 0) {
+				// 这一分辨率下每一档都超过上限：退而取最小的，至少比原画轻
+				for (let i = 0; i < list.length; i++) {
+					const q = list[i]
+					if (q.bitrate <= 0 || resolutionHeight(q.resolution) != bestHeight) {
+						continue
+					}
+					if (fitIndex < 0 || q.bitrate < fitBitrate) {
+						fitIndex = i
+						fitBitrate = q.bitrate
+					}
+				}
+			}
+		}
+		let bestIndex = fitIndex
+		if (wantLow && lowIndex >= 0) {
+			bestIndex = lowIndex
+		}
+		if (bestIndex < 0) {
+			// 把接口原话带出来：常见是 NAS 只给了「原始画质」一档（短视频 / 源本身就是低分辨率），
+			// 或者 decode/info 被拒（签名 / 参数不对）。不写清楚用户只会觉得「档位没区别」。
+			const why = info.error.length > 0 ? info.error : 'NAS 只给了原始画质'
+			if (hevcFallback) {
+				hevcFallbackFailed('该视频编码不支持（' + why + '）')
+			} else {
+				fallbackOriginal('无法转码（' + why + '），已用原画')
+			}
+			return
+		}
+		const pick = list[bestIndex]
+		// 状态行显示「实际档位 + 码率」：4K/20000k 或 360p/500k 一眼能对比
+		videoChosenRes.value = resolutionDisplay(pick.resolution) + '/' +
+			Math.round(pick.bitrate / 1000).toString() + 'k'
+		if (wantLow && fitIndex >= 0 && bestIndex == fitIndex) {
+			// NAS 没有比标清更低的可转档位（常见于源本身就不高的视频）
+			noticeVideoHint('NAS 只有 ' + resolutionDisplay(pick.resolution) + ' 这一档可转，低清与标清相同')
+		}
+		// 目标分辨率落不到（例如要 2.5K 但 NAS 只给到 1080）：如实说明，别让用户以为档位没用
+		if (!hevcFallback && !wantLow) {
+			const wantText = resolutionDisplay(pick.resolution)
+			const chosenH = resolutionHeight(pick.resolution)
+			if (chosenH > 0 && Math.abs(chosenH - target) > 0.5) {
+				noticeVideoHint('NAS 没有 ' + target.toString() + 'P 档，已用最接近的 ' + wantText)
+			}
+		}
+		const stream = await videoPlay(p.id, pick.bitrate, pick.resolution, resumePos)
+		if (seq != videoTranscodeSeq || !alive) {
+			return
+		}
+		if (!stream.ok || stream.path.length == 0) {
+			const why = stream.error.length > 0 ? stream.error : 'NAS 拒绝转码'
+			if (hevcFallback) {
+				hevcFallbackFailed('转码失败（' + why + '），该视频编码不支持')
+			} else {
+				fallbackOriginal('转码失败（' + why + '），已用原画')
+			}
+			return
+		}
+		clearTranscodeTimer()
+		videoPreparing.value = false
+		videoTranscoding.value = false
+		videoTranscodeOn.value = true
+		videoNeedTranscode = false
+		// 竖屏源（旋转 90/270）在转码流里会躺倒：源宽高 + 旋转角都拿到了才能补正
+		videoSourceRotation.value = info.rotation
+		videoSourceWidth.value = info.sourceWidth
+		videoSourceHeight.value = info.sourceHeight
+		updateVideoBoxStyle()
+		if (videoRotateDeg() != 0) {
+			appLog('[v] rotate deg=' + videoRotateDeg() + ' src=' + info.sourceWidth + 'x' +
+				info.sourceHeight + ' nasRot=' + info.rotation)
+		}
+		if (hevcFallback) {
+			// 直接从转码流开播（用户本来就是播到一半卡住的）。
+			// 不传 initial-time：NAS 认不认 `startPosition` 都只有一种时间轴 ——
+			// 认了就从该进度开始，没认就从 0 开始，两种情况都不会把进度条顶到片尾外。
+			videoPlaying.value = true
+			videoEnded.value = false
+			mountVideoStream(mediaUrl(stream.path), 0.0, true)
+			return
+		}
+		videoSrc.value = mediaUrl(stream.path)
+		appLog('[v] transcode ready res=' + videoChosenRes.value + ' pending=' + videoPendingStart)
+		if (videoPendingStart) {
+			videoPendingStart = false
+			startVideo()
+		}
+	}
+
+	/** 调倍速：立即生效，之后的 @play 也会重新应用一次（重挂会丢） */
+	function applyVideoRate(index: number) {
+		videoRateIndex.value = index
+		const rate = VIDEO_RATES[index]
+		const ctx = videoContext()
+		if (ctx != null) {
+			ctx.playbackRate(rate)
+			return
+		}
+		setTimeout(() => {
+			const c = videoContext()
+			if (c != null) {
+				c.playbackRate(rate)
+			}
+		}, 120)
+	}
+
+	/** 换倍速：点一下 chip（TV 按「上」）就往后切一档，到头回到最慢 */
+	function cycleVideoRate() {
+		if (!viewerIsVideo()) {
+			return
+		}
+		let next = videoRateIndex.value + 1
+		if (next >= VIDEO_RATES.length) {
+			next = 0
+		}
+		applyVideoRate(next)
+		flashVideoHint('倍速 ' + videoRateText())
+	}
+
+	/** 卸掉 <video> 并清空播放状态：切图 / 关闭查看器都要调，否则会留下后台声音 */
+
+	/** 转圈图标的旋转样式 */
+	const spinStyle = computed((): string => {
+		return 'transform: rotate(' + spinAngle.value.toString() + 'deg);'
+	})
+
+	/**
+	 * 缓冲提示文案：3 秒内只说「缓冲中」，之后带上秒数并改口「网络较慢」，
+	 * 让用户能判断是网络问题而不是 App 卡死。
+	 */
+	function bufferText(): string {
+		const sec = bufferSeconds.value
+		if (videoFirstFrame.value) {
+			// 已经有源、但播放器还没吐出第一帧（4K 原画这段可能要好幾秒）
+			return sec >= 3 ? '正在加载… ' + sec.toString() + 's' : '正在加载…'
+		}
+		if (sec >= 10) {
+			return '网络很慢，正在缓冲 ' + sec.toString() + 's'
+		}
+		if (sec >= 3) {
+			return '网络较慢，缓冲中 ' + sec.toString() + 's'
+		}
+		return '缓冲中…'
+	}
+
+	function stopVideo() {
+		stopSpinner()
+		stopStallWatch()
+		videoSeq = videoSeq + 1
+		videoSeekDebounce.cancel()
+		clearVideoWatch()
+		if (videoHintTimer > 0) {
+			clearTimeout(videoHintTimer)
+			videoHintTimer = 0
+		}
+		videoSrc.value = ''
+		videoCtx = null
+		videoStarted.value = false
+		videoAutoplay.value = false
+		videoStartPos.value = 0.0
+		videoPlaying.value = false
+		videoEnded.value = false
+		videoPreparing.value = false
+		videoError.value = ''
+		videoPos.value = 0.0
+		videoDur.value = 0.0
+		videoSeekTarget = -1.0
+		videoHoldUntil = 0
+		videoHint.value = ''
+		videoFallbackTried = false
+		// 转码：作废在途回调 + 清掉超时计时器，否则关掉查看器还在等 NAS
+		videoTranscodeSeq = videoTranscodeSeq + 1
+		clearTranscodeTimer()
+		videoPreparing.value = false
+		videoTranscoding.value = false
+		videoTranscodeOn.value = false
+		videoPendingStart = false
+		videoTriedDirectFallback = false
+		videoNeedTranscode = false
+		videoTriedHevcTranscode = false
+		videoChosenRes.value = ''
+		resetVideoRotation()
+	}
+
+	/**
+	 * 浏览器里「切走窗口 / 切标签再回来」时可能出现两类问题（2026-11-22 用户实测）：
+	 *
+	 * 1. **正在播**的 `<video>` 回来会彻底冻住（play 无效）→ 切走时直接停播；
+	 * 2. 回来后**键盘像失灵**（浏览器把键盘焦点交给了别的窗口/地址栏，keydown 到不了页面）
+	 *    → 回来时把按键订阅重挂一遍 + 提示「点一下画面」。
+	 *
+	 * 只在 web 生效（App 端切后台由系统管，不需要这段）。
+	 */
+	// #ifdef WEB
+	function onWebHidden() {
+		// 实况片段也是 <video>，一起停掉
+		if (livePlaying.value) {
+			stopLive()
+		}
+		if (videoStarted.value) {
+			stopVideo()
+			flashVideoHint('已切走窗口 · 回来按 OK 继续')
+		}
+	}
+	// #endif
+
+	/** 打开 / 换片时的初始状态：停在「按 OK 开始播放」 */
+	function videoFreshOpen() {
+		videoStarted.value = false
+		videoAutoplay.value = false
+		videoStartPos.value = 0.0
+		videoPlaying.value = false
+		videoEnded.value = false
+		videoError.value = ''
+		videoPos.value = 0.0
+		videoDur.value = 0.0
+		videoSeekTarget = -1.0
+		videoHoldUntil = 0
+		videoFallbackTried = false
+		videoTranscoding.value = false
+		videoTranscodeOn.value = false
+		videoPendingStart = false
+		videoTriedDirectFallback = false
+		videoNeedTranscode = false
+		videoTriedHevcTranscode = false
+		resetVideoRotation()
+		// 换片 / 关查看器：转圈状态收干净（常驻 tick 会在 next tick 归零）
+		stopSpinner()
+		// 每个视频都从 1.0x 开始，不继承上一个视频调过的倍速
+		videoRateIndex.value = VIDEO_RATE_DEFAULT
+	}
+
+	/**
+	 * 打开一个视频文件：**不自动播放**，只把地址和请求头准备好，等用户按 OK。
+	 *
+	 * 地址按设置页的档位（`fnos.video.quality`，T4.6）：
+	 * 原图 → 直链播原画（`photo.video`，不发任何转码请求）；
+	 * 标清 / 低清 → 按 OK 时申请转码流（状态行「转码中…」），准备好再换成 HLS 地址。
+	 * 档位在**每次打开视频时**重新读，所以改完设置后下一张视频就生效，正在播的不打断。
+	 *
+	 * HEVC 兼容开关（`fnos.video.hevc`，T4.8）也在这里读一次：它不改变「播哪条流」，
+	 * 只决定**原画放不出来时**要不要请 NAS 转一份 H.264（见 `onVideoError`）。
+	 *
+	 * **web 端永远播原画**（浏览器放不了 NAS 的 HLS，`utssdk/web` 的 videoInfo/videoPlay
+	 * 就是返回错误的桩），所以浏览器里三档必然一样 —— 这不是 bug，验清晰度必须上 App 端。
+	 */
+	async function playVideo(p: PhotoItem) {
+		if (p.video.length == 0) {
+			videoError.value = '该视频没有可播放地址'
+			return
+		}
+		videoFreshOpen()
+		videoHevcCompat = readHevcCompat()
+		const h = videoHeader()
+		if (h != null) {
+			videoHeaderObj.value = h
+			videoHeaderOk.value = true
+		} else {
+			// 没 token：App 端直链和 HLS 都会 401，播放器只会报「Source error」
+			videoHeaderOk.value = false
+		}
+		const quality = readVideoQuality()
+		let transcode = quality != VIDEO_QUALITY_ORIGINAL
+		// #ifdef WEB
+		// 浏览器播不了 NAS 的转码流（HLS），web 端的 videoInfo / videoPlay 也只是返回错误的桩
+		// → 一律走原画；状态行也必须写「原画」，不能写着「低清」却播原画（用户会被误导）。
+		transcode = false
+		if (quality != VIDEO_QUALITY_ORIGINAL) {
+			setVideoHint('浏览器只播原画（清晰度仅 App 生效）', 3000)
+		}
+		// #endif
+		// 状态行写「实际在播什么」：转码档位 → 标清 / 低清；否则一律「原画」
+		videoQualityShown.value = transcode ? videoQualityLabel(quality) : '原画'
+		videoChosenRes.value = ''
+		if (!transcode) {
+			videoSrc.value = mediaUrl(p.video)
+			return
+		}
+		// 转码流不加查询串就不存在，所以这里**先不申请**：等用户按 OK 再开始转码，
+		// 左右快速浏览时不会给 NAS 排一堆没人看的转码任务。见 `toggleVideoPlay`。
+		videoNeedTranscode = true
+		videoSrc.value = ''
+	}
+
+	/** 真的开始播了：清掉「已结束」，图标切成暂停态，并补一次倍速（重挂会丢） */
+	function onVideoPlay() {
+		appLog('[v] event play')
+		resetProgressBase()
+		const ctx = videoContext()
+		if (ctx != null && VIDEO_RATES[videoRateIndex.value] != 1.0) {
+			ctx.playbackRate(VIDEO_RATES[videoRateIndex.value])
+		}
+		videoPlaying.value = true
+		videoEnded.value = false
+		// 出画面了：收掉「等首帧」
+		stopSpinner()
+		// 播放中一直盯着进度空档，停了就转圈
+		startStallWatch()
+		// 播放器说「开始了」不代表真的有画面：8 秒还没进度就走下载兜底
+		// （真机实测过原画黑屏 + 进度 0:00 且不报错的情况）
+		armVideoWatch()
+	}
+
+	function onVideoPause() {
+		videoPlaying.value = false
+		// 暂停时不该显示「缓冲中」，否则看着像卡住
+		stopSpinner()
+		stopStallWatch()
+	}
+
+	function onVideoEnded() {
+		videoPlaying.value = false
+		videoEnded.value = true
+		stopSpinner()
+		stopStallWatch()
+		if (videoDur.value > 0.0) {
+			videoPos.value = videoDur.value
+		}
+	}
+
+	/**
+	 * 缓冲中（网络等数据 / 解码跟不上）。
+	 * 只负责「转圈」，不动进度（进度由 timeupdate 自己跟）。
+	 */
+	function onVideoWaiting() {
+		if (!videoStarted.value || videoError.value.length > 0) {
+			return
+		}
+		videoBuffering.value = true
+		if (!videoPlaying.value) {
+			flashVideoHint('缓冲中…')
+		}
+	}
+
+	/**
+	 * 进度回调：约 250ms 一次。
+	 *
+	 * ⚠️ **不要每次回调都写 `videoPos`**：它是响应式的，每次写都会让进度条 +
+	 * 两个时间文本重新渲染，一秒 4 次。弱一点的电视盒子上这一步会和视频解码抢主线程，
+	 * 表现就是「原片不卡、这里丢帧」（2026-11-23 真机实测）。
+	 * 现在按 **1 秒** 的粒度更新（进度条本来就只显示到秒）。
+	 */
+	function onVideoTime(e: UniVideoTimeUpdateEvent) {
+		// ⚠️ 不能「收到 timeupdate 就结束缓冲」：出首帧之前播放器也会按固定频率刷进度，
+		// 但 currentTime 一直是 0。以前这么做会和看门狗打架 —— 秒数被反复清零，
+		// 界面上就是「圈在转、永远停在 正在加载…」。只有真的往前走了才算结束。
+		const t0 = e.detail.currentTime
+		// 位置真的变了才算有进度（停住时 currentTime 不再前进，但回调仍在刷）
+		if (Math.abs(t0 - lastPosSeen) > 0.01) {
+			lastPosSeen = t0
+			lastProgressAt = Date.now()
+		}
+		if (videoFirstFrame.value && t0 > 0.2) {
+			stopSpinner()
+			startStallWatch()
+		}
+		const d = e.detail.duration
+		// 部分播放器首帧前给 0，别把已知时长覆盖掉
+		if (d > 0.0 && Math.abs(d - videoDur.value) > 0.2) {
+			videoDur.value = d
+		}
+		// 刚发出的 seek 还没落地，这段时间的 currentTime 是旧位置
+		if (Date.now() < videoHoldUntil) {
+			return
+		}
+		let t = e.detail.currentTime
+		if (t < 0.0) {
+			t = 0.0
+		}
+		if (Math.abs(t - videoPos.value) < 1.0 && t > videoPos.value) {
+			// 距上次不到 1 秒：跳过这次重渲染（往回跳 / seek 不受这条限制）
+			return
+		}
+		videoPos.value = t
+	}
+
+	/**
+	 * 放不出来（直链没带上鉴权 / 编码不支持 / 服务端没给地址）：
+	 * App 端按序降级，每级只试一次（T4.8）——
+	 *   ① 转码流失败 → 回原画直链；
+	 *   ② 原画直链失败 → 若开了「HEVC 转 H.264」就让 NAS 转一份 H.264 从当前进度续播（默认关闭，跳过）；
+	 *   ③ 还不行 → 「下载到本地再播」；
+	 *   ④ 仍失败才卸载并报错。
+	 *
+	 * `@error` 的 `detail.errMsg` 会显示在状态行上一部分：这是排查「到底是 401 还是解码不支持」
+	 * 最快的证据。注意：**编码不支持有时不报错**（只有声音没画面），这种情况本实现兜不住，
+	 * 需要用户自己把清晰度设成标清 / 低清（那本来就是 H.264）。
+	 */
+	async function onVideoError(e: UniVideoErrorEvent) {
+		const errMsg = e.detail.errMsg
+		const why = shortText(errMsg.length > 0 ? errMsg : '未知错误', 56)
+		appLog('[v] event error ' + why)
+		// #ifdef APP-ANDROID
+		const p = currentPhoto()
+		// ① 转码流放不出来（m3u8 / 分片被拒、解码不支持）：先退回原画直链，别直接判死
+		if (p != null && videoTranscodeOn.value && !videoTriedDirectFallback && p.video.length > 0) {
+			videoTriedDirectFallback = true
+			videoTranscodeOn.value = false
+			resetVideoRotation()
+			videoQualityShown.value = '原画'
+			videoChosenRes.value = ''
+			noticeVideoHint('转码流播不出来（' + why + videoDebugSuffix() + '），已用原画')
+			mountVideoStream(mediaUrl(p.video), videoPos.value, videoPlaying.value || !videoStarted.value)
+			return
+		}
+		// ② 原画放不出来，多半是 HEVC/H.265 硬解不支持：开关开着才请 NAS 转 H.264（T4.8）
+		if (p != null && videoHevcCompat && !videoTriedHevcTranscode && p.video.length > 0) {
+			noticeVideoHint('原画放不出来，正在转码为 H.264…')
+			prepareTranscode(p, VIDEO_QUALITY_ORIGINAL, true)
+			return
+		}
+		// ③ 下载原文件到本地再播（只解决网络 / 直链问题，编码不变）
+		if (p != null && !videoFallbackTried && p.video.length > 0) {
+			await fallbackDownload(why)
+			return
+		}
+		// #endif
+		videoFail(why)
+	}
+
+	/** 从 0 重播（播完后 OK 键）：重挂一次，保证回到第一帧 */
+	function replayVideo() {
+		// 重播要「卸载再重建」<video>，三种更轻的做法真机都不行：
+		//   ① 重新下发同一个 src —— 地址没变，元素不会重新加载；
+		//   ② 只 ctx.play() —— ExoPlayer 到过 ended 后 play() 立刻又结束；
+		//   ③ ctx.seek(0) + play() —— 实测无效（65 秒后仍停在 0:30 转圈）。
+		// 所以先把 v-if 关掉（下一拍再开），让原生播放器彻底重建，从 0 开始。
+		const url = videoSrc.value
+		videoEnded.value = false
+		videoPos.value = 0.0
+		videoStartPos.value = 0.0
+		videoPlaying.value = true
+		videoHoldUntil = Date.now() + 1200
+		resetProgressBase()
+		videoCtx = null
+		videoStarted.value = false
+		videoSrc.value = ''
+		setTimeout(() => {
+			if (!alive || url.length == 0) {
+				return
+			}
+			// 换 id：不然原生播放器会按 id 复用旧实例，位置还停在片尾
+			videoRebuildSeq = videoRebuildSeq + 1
+			videoElId.value = 'pw-video-' + videoRebuildSeq.toString()
+			videoSrc.value = url
+			videoAutoplay.value = true
+			videoStartPos.value = 0.0
+			videoPos.value = 0.0
+			videoEnded.value = false
+			videoStarted.value = true
+			markFirstFrameWait()
+			setTimeout(() => {
+				if (!alive) {
+					return
+				}
+				const c = videoContext()
+				if (c != null && videoPlaying.value) {
+					c.play()
+				}
+			}, 300)
+		}, 80)
+	}
+
+	/** OK 键 / 点状态条图标：开始播放、播放 ↔ 暂停、播完重播 */
+	function toggleVideoPlay() {
+		appLog('[v] ok preparing=' + videoPreparing.value + ' started=' + videoStarted.value +
+			' needTc=' + videoNeedTranscode + ' srcLen=' + videoSrc.value.length +
+			' errLen=' + videoError.value.length)
+		if (videoPreparing.value) {
+			// 转码还没就绪：记住「用户想播」，转码完成后自动开播，不用再按一次 OK
+			videoPendingStart = true
+			flashVideoHint(videoTranscoding.value ? '转码中…' : '正在准备视频…')
+			return
+		}
+		if (videoError.value.length > 0) {
+			return
+		}
+		if (!videoStarted.value) {
+			// 档位不是原图：先申请转码流（状态行「转码中…」），就绪后自动开播
+			if (videoNeedTranscode && videoSrc.value.length == 0) {
+				const p = currentPhoto()
+				if (p == null || p.video.length == 0) {
+					videoError.value = '该视频没有可播放地址'
+					return
+				}
+				videoPendingStart = true
+				prepareTranscode(p, readVideoQuality(), false)
+				return
+			}
+			startVideo()
+			return
+		}
+		if (videoEnded.value) {
+			replayVideo()
+			return
+		}
+		const ctx = videoContext()
+		if (ctx == null) {
+			videoPlaying.value = true
+			setTimeout(() => {
+				const c = videoContext()
+				if (c != null) {
+					c.play()
+				}
+			}, 120)
+			return
+		}
+		if (videoPlaying.value) {
+			ctx.pause()
+			videoPlaying.value = false
+		} else {
+			ctx.play()
+			videoPlaying.value = true
+		}
+	}
+
+	/**
+	 * 左右键快进 / 后退。
+	 * 连按不排队：每次都从「上一次的目标」继续累加，真正的 seek 用 180ms 去抖只发最后一次。
+	 */
+	function seekVideo(delta: number) {
+		if (!videoStarted.value) {
+			flashVideoHint('按 OK 开始播放')
+			return
+		}
+		if (videoPreparing.value) {
+			flashVideoHint(videoTranscoding.value ? '转码中…' : '正在准备视频…')
+			return
+		}
+		if (videoError.value.length > 0) {
+			return
+		}
+		const ctx = videoContext()
+		if (ctx == null) {
+			flashVideoHint('播放器还没就绪')
+			return
+		}
+		if (videoEnded.value && delta > 0.0) {
+			flashVideoHint('已到视频结尾')
+			return
+		}
+		const base = videoSeekTarget >= 0.0 ? videoSeekTarget : videoPos.value
+		const dur = videoDur.value
+		let target = base + delta
+		if (target < 0.0) {
+			target = 0.0
+		}
+		if (dur > 0.0) {
+			// 留 0.3 秒：正好 seek 到 duration 有的播放器会立刻触发 ended
+			let tail = dur - 0.3
+			if (tail < 0.0) {
+				tail = 0.0
+			}
+			if (target > tail) {
+				target = tail
+			}
+		}
+		if (target == base) {
+			flashVideoHint(delta < 0.0 ? '已到视频开头' : '已到视频结尾')
+			return
+		}
+		videoEnded.value = false
+		videoSeekTarget = target
+		videoPos.value = target
+		videoHoldUntil = Date.now() + 700
+		flashVideoHint((delta < 0.0 ? '后退 ' : '快进 ') + Math.round(Math.abs(delta)).toString() + ' 秒')
+		videoSeekDebounce.schedule(() => {
+			const c = videoContext()
+			if (c != null && videoSeekTarget >= 0.0) {
+				c.seek(videoSeekTarget)
+			}
+			videoSeekTarget = -1.0
+		})
+	}
+
+	// ---------------- 加载当前这张 ----------------
+
+
+
+	/** 预取相邻一张的 medium：网格里已经缓存过同一 sUrl，左右切换时基本瞬开 */
+	function prefetchNeighbor(idx: number) {
+		const list = props.photos
+		if (idx < 0 || idx >= list.length) {
+			return
+		}
+		const p = list[idx]
+		if (p == null) {
+			return
+		}
+		const path = p.medium.length > 0 ? p.medium : p.thumb
+		if (path.length > 0) {
+			image(path)
+		}
+	}
+
+	/**
+	 * 显示 props.index 这张：先 medium（网格用的同一 sUrl，通常已在本地缓存）→ 再异步换原图。
+	 * 两次替换都走 `setViewerImage`（双缓冲），后台图片就绪后只切层级，不重新解码，所以不黑屏。
+	 */
+	function loadCurrent() {
+		const p = currentPhoto()
+		if (p == null) {
+			return
+		}
+		viewerTriedFile = false
+		updateInfo(p)
+		// 先卸掉上一张可能还在播的实况片段 / 视频；实况照片的静态图照常加载，
+		// 片段下载完自动带声音播一遍（浏览器拦下时自动回退静音），播完回到图片
+		stopLive()
+		stopVideo()
+		if (p.cat == 'video') {
+			playVideo(p)
+		} else if (p.live && p.video.length > 0) {
+			playLive(p, false)
+		}
+		viewerSeq = viewerSeq + 1
+		const seq = viewerSeq
+		scheduleDetail(p, seq)
+		const med = p.medium.length > 0 ? p.medium : p.thumb
+		if (med.length > 0) {
+			image(med).then((local: string) => {
+				if (seq != viewerSeq || !alive) {
+					return
+				}
+				if (local.length > 0) {
+					setViewerImage(local)
+				}
+				// 原图可能几 MB：medium 已经在屏上了，后台下完再替换。
+				// 停留 120ms 才发起（以前 300ms，真机反馈「等原图有点慢」）：
+				// 快速连切时照样会跳过，只是不在中等尺寸上多等 0.2 秒。
+				const full = p.cat == 'video' ? '' : p.original
+				if (full.length == 0 || full == med) {
+					return
+				}
+				setTimeout(() => {
+					if (seq != viewerSeq || !alive) {
+						return
+					}
+					image(full).then((big: string) => {
+						if (seq != viewerSeq || !alive) {
+							return
+						}
+						if (big.length > 0) {
+							setViewerImage(big)
+						}
+					})
+				}, 120)
+			})
+		}
+		prefetchNeighbor(props.index - 1)
+		prefetchNeighbor(props.index + 1)
+	}
+
+	/** 上一张 / 下一张交给页面（图库那边要跨页补数据，只有页面知道） */
+	function requestNav(delta: number) {
+		if (delta < 0 && !props.canPrev) {
+			return
+		}
+		if (delta > 0 && !props.canNext) {
+			return
+		}
+		emit('nav', delta)
+	}
+
+	/** 关闭：把所有在播的东西停掉，再交回页面（页面负责恢复滚动、重新订阅按键） */
+	function closeSelf() {
+		alive = false
+		stopLive()
+		stopVideo()
+		viewerSeq = viewerSeq + 1
+		clearViewerImage()
+		viewerInfo.value = false
+		infoLoading.value = false
+		emit('close')
+	}
+
+	/**
+	 * 层「viewer.detail」：详情面板展开时压在最上面。
+	 *
+	 * 上键 / 返回键 / 菜单键都只**收起详情**（用户口径：详情是好一层，返回先退这一层）；
+	 * 下键保持展开；其它键交回下一层（左右仍能切图）。
+	 */
+	function onDetailKey(code: number): boolean {
+		if (code == KEY_UP || code == KEY_BACK || code == KEY_MENU) {
+			viewerInfo.value = false
+			return true
+		}
+		if (code == KEY_DOWN) {
+			return true
+		}
+		return false
+	}
+
+	/**
+	 * 层「viewer.video」：可拖动的视频（有播放地址且没报错）。
+	 * 左右 ±10 秒、OK 播放/暂停、上 收详情 / 切倍速；下键不认识，交回基础层开详情。
+	 *
+	 * **没真正播起来时左右不算快进**：交回基础层当「上一张 / 下一张」，
+	 * 否则进了视频就切不走（用户反馈：从图片左右翻到视频后卡在这里）。
+	 * 「没播起来」包括：还没按 OK、正在准备、正在等 NAS 转码。
+	 */
+	function onVideoKey(code: number): boolean {
+		if ((code == KEY_LEFT || code == KEY_RIGHT) && !videoPlaying.value) {
+			// **只有真正在播时才把左右当快进**：暂停 / 结束 / 出错 / 还没播 / 准备中，
+			// 左右一律交回基础层当「上一张 / 下一张」。
+			// 以前只看 videoStarted，播过一帧但已经停住（最常见的是播放失败/暂停）时
+			// 左右会一直走「快进」分支，用户看到的就是「视频里翻不动、像卡死」。
+			return false
+		}
+		if (code == KEY_UP) {
+			if (viewerInfo.value) {
+				viewerInfo.value = false
+			} else {
+				cycleVideoRate()
+			}
+			return true
+		}
+		if (code == KEY_LEFT) {
+			seekVideo(-VIDEO_SEEK_STEP)
+			return true
+		}
+		if (code == KEY_RIGHT) {
+			seekVideo(VIDEO_SEEK_STEP)
+			return true
+		}
+		if (code == KEY_OK || code == KEY_ENTER) {
+			toggleVideoPlay()
+			return true
+		}
+		return false
+	}
+
+	/** 层「viewer.video-dead」：视频但不可拖动（地址缺失 / 解码失败），OK 直接关闭，别让用户卡死 */
+	function onVideoDeadKey(code: number): boolean {
+		if (code == KEY_OK || code == KEY_ENTER) {
+			closeSelf()
+			return true
+		}
+		return false
+	}
+
+	/**
+	 * 层「viewer.base」：照片 / 实况的基础键位。
+	 * 左右切图、下 / 菜单键 开详情、上 收详情、返回关闭、OK 重播实况（普通照片则关闭）。
+	 */
+	function onViewerKey(code: number): boolean {
+		if (code == KEY_LEFT) {
+			requestNav(-1)
+		} else if (code == KEY_RIGHT) {
+			requestNav(1)
+		} else if (code == KEY_DOWN) {
+			viewerInfo.value = true
+		} else if (code == KEY_MENU) {
+			// 遥控器「菜单」键：开关详情（与浏览器里点「!」等价）
+			toggleViewerInfo()
+		} else if (code == KEY_UP) {
+			if (viewerInfo.value) {
+				viewerInfo.value = false
+			}
+		} else if (code == KEY_BACK) {
+			if (viewerIsVideo() && videoStarted.value) {
+				// 用户口径（2026-11-22）：视频播放中按返回，先退回「按 OK 开始播放」，
+				// 这时左右键能切上一张 / 下一张；再按一次返回才关查看器
+				stopVideo()
+				flashVideoHint('已停止播放 · 左右键切图')
+			} else {
+				closeSelf()
+			}
+		} else if (code == KEY_OK || code == KEY_ENTER) {
+			// 实况照片：OK 用作「重播」；其它照片 OK 关闭
+			if (canReplayLive()) {
+				replayLive()
+			} else {
+				closeSelf()
+			}
+		} else {
+			return false
+		}
+		return true
+	}
+
+	/** 层名 → 处理函数（UTS 不能把函数放进容器，所以用名字查表） */
+	function runKeyLayer(layer: string, code: number): boolean {
+		if (layer == 'viewer.detail') {
+			return onDetailKey(code)
+		}
+		if (layer == 'viewer.video') {
+			return onVideoKey(code)
+		}
+		if (layer == 'viewer.video-dead') {
+			return onVideoDeadKey(code)
+		}
+		if (layer == 'viewer.base') {
+			return onViewerKey(code)
+		}
+		return false
+	}
+
+	/**
+	 * 遥控器入口（组件在挂载期间独占按键通道，T5 分发层）：
+	 *   视频 —— 左右 ±10 秒、OK 播放/暂停、上 倍速/收详情、返回关闭；
+	 *   照片 —— 左右切图、下 详情、上 收详情、OK 关闭（实况则重播）、返回关闭。
+	 * 栈底是查看器本身，视频能力与详情面板按当前状态压在上面。
+	 */
+	function handleKey(code: number) {
+		const stack: Array<string> = []
+		stack.push('viewer.base')
+		if (viewerIsVideo()) {
+			if (videoSeekable()) {
+				stack.push('viewer.video')
+			} else {
+				stack.push('viewer.video-dead')
+			}
+		}
+		if (viewerInfo.value) {
+			stack.push('viewer.detail')
+		}
+		dispatchKey(code, stack, (layer: string, c: number): boolean => {
+			return runKeyLayer(layer, c)
+		})
+	}
+
+	function armKeyHook() {
+		keyHook = startTvKeyHook((code: number) => {
+			handleKey(code)
+		})
+	}
+
+	// #ifdef WEB
+	/**
+	 * 回到页面（窗口/标签切回来）：把按键订阅重挂一遍 + 给一句提示。
+	 *
+	 * 浏览器切窗口后，keydown 经常会送到别的窗口/地址栏（页面根本没收到），
+	 * 用户看到的就是「按键全都没反应、像卡死」。重挂订阅是无害的，
+	 * 提示则告诉用户「点一下画面就好」。
+	 */
+	function onWebShown() {
+		armKeyHook()
+		flashVideoHint('已切回窗口 · 若按键没反应请点一下画面')
+	}
+
+	/** web 专用：监听窗口可见性 / 焦点，隐藏时停播、回来时重挂按键（见 onWebHidden / onWebShown） */
+	function installWebWatch() {
+		try {
+			const g: any = globalThis
+			const doc: any = g.document
+			if (doc == null) {
+				return
+			}
+			doc.addEventListener('visibilitychange', () => {
+				if (doc.visibilityState == 'hidden') {
+					onWebHidden()
+				} else {
+					onWebShown()
+				}
+			})
+			// alt-tab 切窗口时 visibilityState 不一定变，再补一对 blur / focus
+			g.addEventListener('blur', () => {
+				onWebHidden()
+			})
+			g.addEventListener('focus', () => {
+				onWebShown()
+			})
+		} catch (e) {
+			// 非浏览器环境：忽略
+		}
+	}
+	// #endif
+
+	/**
+	 * 页面换了一张（可能是跨页补数据后）就重新加载；关闭时组件已被卸载。
+	 *
+	 * UTS 里 watch 的 getter **必须显式写返回类型**，回调参数也要显式标注，
+	 * 否则 Kotlin 侧报 `Return type mismatch: expected 'Function', actual 'Number'`
+	 * （官方示例：`watch(() : string => obj.str, (str : string, prev : string) => {})`）。
+	 */
+	watch((): number => props.index, (index: number, oldIndex: number) => {
+		if (alive) {
+			loadCurrent()
+		}
+	})
+
+	onMounted(() => {
+		// 转圈用「常驻 tick」，打开查看器就一直跑，只按状态干活（见 spinnerTick）
+		armSpinnerTick()
+		armKeyHook()
+		loadCurrent()
+		// 只在 web：切走窗口时停播、回来重挂按键（见 installWebWatch）
+		// #ifdef WEB
+		installWebWatch()
+		// #endif
+	})
+
+	onUnmounted(() => {
+		stopSpinnerTick()
+		alive = false
+		stopLive()
+		stopVideo()
+		clearViewerImage()
+		stopTvKeyHook(keyHook)
+	})
+</script>
+
+<style>
+	/* 整页覆盖：父页面 .page 是 relative + flex:1，absolute 子元素默认包含 padding 区，
+	   四边贴满即可，不用 fixed（uvue 上 fixed 的裁剪行为依赖父级） */
+	.viewer {
+		position: absolute;
+		left: 0;
+		top: 0;
+		width: 100%;
+		height: 100%;
+		flex-direction: column;
+		align-items: center;
+		background-color: #050506;
+		z-index: 100;
+	}
+
+	/* 浏览器工具条：感叹号（详情）+ 关闭，浮在右上角；TV 端没有这两个按钮 */
+	.vw-tools {
+		position: absolute;
+		right: 16rpx;
+		top: 16rpx;
+		flex-direction: row;
+		align-items: center;
+	}
+
+	.vw-tool {
+		width: 36rpx;
+		height: 32rpx;
+		align-items: center;
+		justify-content: center;
+		border-radius: 8rpx;
+		background-color: #1E1E24;
+		margin-left: 8rpx;
+	}
+
+	.vw-tool-text {
+		font-size: 14rpx;
+		font-weight: bold;
+		color: #C6C6CB;
+	}
+
+	/* 详情面板：图片下方、左右铺满。左栏人物/相册，右栏参数（半行两列，路径/位置整行） */
+	.vw-info {
+		width: 100%;
+		flex-direction: row;
+		margin-top: 8rpx;
+		margin-bottom: 10rpx;
+		padding-left: 14rpx;
+		padding-right: 14rpx;
+		padding-top: 10rpx;
+		padding-bottom: 10rpx;
+		border-radius: 8rpx;
+		background-color: #141418;
+		border-width: 1rpx;
+		border-style: solid;
+		border-color: #26262E;
+	}
+
+	.vw-info-left {
+		width: 280rpx;
+		flex-direction: column;
+	}
+
+	.vw-info-right {
+		flex: 1;
+		flex-direction: row;
+		flex-wrap: wrap;
+		margin-left: 12rpx;
+	}
+
+	.vw-sec {
+		flex-direction: column;
+		margin-bottom: 6rpx;
+	}
+
+	.vw-sec-title {
+		font-size: 9rpx;
+		color: #7C7D7F;
+		margin-bottom: 4rpx;
+	}
+
+	.vw-chips {
+		flex-direction: row;
+		flex-wrap: wrap;
+	}
+
+	.vw-person {
+		flex-direction: row;
+		align-items: center;
+		margin-right: 8rpx;
+		margin-bottom: 4rpx;
+	}
+
+	.vw-avatar {
+		width: 32rpx;
+		height: 32rpx;
+		border-radius: 16rpx;
+	}
+
+	.vw-avatar-ph {
+		align-items: center;
+		justify-content: center;
+		background-color: #2A2A32;
+	}
+
+	.vw-avatar-ph-text {
+		font-size: 10rpx;
+		color: #C6C6CB;
+	}
+
+	.vw-person-name {
+		font-size: 9rpx;
+		color: #E9EBEE;
+		margin-left: 4rpx;
+	}
+
+	.vw-album {
+		flex-direction: row;
+		align-items: center;
+		margin-bottom: 4rpx;
+	}
+
+	.vw-album-cover {
+		width: 34rpx;
+		height: 34rpx;
+		border-radius: 5rpx;
+	}
+
+	.vw-album-meta {
+		flex: 1;
+		flex-direction: column;
+		margin-left: 5rpx;
+	}
+
+	.vw-album-name {
+		font-size: 9rpx;
+		color: #E9EBEE;
+	}
+
+	.vw-album-sub {
+		font-size: 8rpx;
+		color: #7C7D7F;
+	}
+
+	.vw-field {
+		width: 50%;
+		flex-direction: row;
+		margin-bottom: 5rpx;
+	}
+
+	.vw-field-full {
+		width: 100%;
+	}
+
+	.vw-field-label {
+		width: 40rpx;
+		font-size: 8rpx;
+		color: #7C7D7F;
+	}
+
+	.vw-field-value {
+		flex: 1;
+		font-size: 8rpx;
+		color: #E9EBEE;
+	}
+
+	.vw-info-loading {
+		font-size: 9rpx;
+		color: #7C7D7F;
+		margin-top: 4rpx;
+	}
+
+	/* 图片舞台：占满详情面板以上的空间；详情展开时自动变矮，图片跟着缩小 */
+	.vw-stage {
+		flex: 1;
+		width: 100%;
+		min-height: 110rpx;
+		position: relative;
+		align-items: center;
+		justify-content: center;
+		background-color: #050506;
+	}
+
+	/* 双缓冲的两层图片：绝对定位完全重合，靠 z-index / opacity 切换。
+	   后层 opacity: 0 有两个作用：加载中不可见（不会露出旧图的边），
+	   加载完成由脚本把它切到前层（z-index 2、opacity 1），全程不改 src → 不重新解码 */
+	.vw-img {
+		position: absolute;
+		left: 0;
+		top: 0;
+		width: 100%;
+		height: 100%;
+	}
+
+	.vw-img-front {
+		z-index: 2;
+		opacity: 1;
+	}
+
+	.vw-img-back {
+		z-index: 1;
+		opacity: 0;
+	}
+
+	/* 实况片段：绝对定位铺满舞台、盖在静态图上。video 默认尺寸 300×225，不显式给宽高会缩在中间。
+	   z-index 必须高于双缓冲图片（1 / 2），否则会被盖住 */
+	.vw-live {
+		position: absolute;
+		left: 0;
+		top: 0;
+		width: 100%;
+		height: 100%;
+		z-index: 3;
+		background-color: transparent;
+	}
+
+	/* 还没出画面（挂载 → 首帧解码之间）先透明：这段窗口 video 是黑底，
+	   部分平台还会闪一下原生播放按钮。收到 @play 才切成可见 */
+	.vw-live-idle {
+		opacity: 0;
+	}
+
+	/* 缓冲提示：铺满舞台居中一个半透明胶囊（不吃布局，也不挡按键） */
+	.vw-buffer {
+		position: absolute;
+		left: 0;
+		top: 0;
+		width: 100%;
+		height: 100%;
+		z-index: 6;
+		align-items: center;
+		justify-content: center;
+	}
+
+	.vw-buffer-box {
+		flex-direction: row;
+		align-items: center;
+		padding-left: 18rpx;
+		padding-right: 22rpx;
+		padding-top: 10rpx;
+		padding-bottom: 10rpx;
+		border-radius: 30rpx;
+		background-color: rgba(0, 0, 0, 0.62);
+	}
+
+	/* 转圈：uvue 没有 CSS keyframes，靠 JS 每 100ms 改 transform 转 */
+	.vw-buffer-ring {
+		width: 24rpx;
+		height: 24rpx;
+		border-width: 4rpx;
+		border-style: solid;
+		border-color: #FFFFFF;
+		border-top-color: rgba(255, 255, 255, 0);
+		border-radius: 12rpx;
+	}
+
+	.vw-buffer-text {
+		margin-left: 12rpx;
+		font-size: 11rpx;
+		color: #E8E8EA;
+	}
+
+	/* 视频文件：同样铺满舞台盖住封面图。App 端原生 video 不吃 opacity，统一黑底更稳。
+	   z-index 必须高于双缓冲图片（1 / 2） */
+	.vw-video {
+		position: absolute;
+		left: 0;
+		top: 0;
+		width: 100%;
+		height: 100%;
+		z-index: 3;
+		background-color: #000000;
+	}
+
+	/* 视频控制区：在画面下方（App 原生 video 会压住覆盖层，状态不能叠在画面上） */
+	.vp-wrap {
+		width: 100%;
+		flex-direction: column;
+		background-color: #101014;
+	}
+
+	.vp-line {
+		width: 100%;
+		height: 22rpx;
+		flex-direction: row;
+		align-items: center;
+		padding-left: 12rpx;
+		padding-right: 12rpx;
+	}
+
+	.vp-line-right {
+		flex-direction: row;
+		align-items: center;
+	}
+
+	.vp-state {
+		flex: 1;
+		font-size: 10rpx;
+		color: #8A8B90;
+	}
+
+	/* 倍速：点一下切下一档（TV 上按「上」键等价），做得够大好点 */
+	.vp-chip {
+		height: 18rpx;
+		margin-left: 6rpx;
+		padding-left: 10rpx;
+		padding-right: 10rpx;
+		border-radius: 9rpx;
+		font-size: 10rpx;
+		color: #D5D7DB;
+		background-color: #262A33;
+	}
+
+	.vp-bar {
+		width: 100%;
+		height: 26rpx;
+		flex-direction: row;
+		align-items: center;
+		padding-left: 12rpx;
+		padding-right: 12rpx;
+	}
+
+	.vp-ico {
+		width: 24rpx;
+		height: 20rpx;
+		align-items: center;
+		justify-content: center;
+		border-radius: 6rpx;
+		background-color: #3388FF;
+	}
+
+	.vp-ico-text {
+		font-size: 10rpx;
+		font-weight: bold;
+		color: #FFFFFF;
+	}
+
+	/* 暂停图标用两根小竖条拼，别用字形：部分 Android 会把 ⏸ 渲染成彩色 emoji */
+	.vp-ico-pause {
+		flex-direction: row;
+		align-items: center;
+	}
+
+	.vp-ico-bar {
+		width: 2rpx;
+		height: 9rpx;
+		margin-left: 1rpx;
+		margin-right: 1rpx;
+		background-color: #FFFFFF;
+	}
+
+	.vp-time {
+		width: 40rpx;
+		font-size: 9rpx;
+		color: #8A8B90;
+		text-align: center;
+	}
+
+	.vp-track {
+		flex: 1;
+		height: 5rpx;
+		margin-left: 6rpx;
+		margin-right: 6rpx;
+		border-radius: 3rpx;
+		background-color: #2A2A32;
+		overflow: hidden;
+	}
+
+	.vp-fill {
+		height: 5rpx;
+		border-radius: 3rpx;
+		background-color: #3388FF;
+	}
+
+	.vw-hint {
+		flex: 1;
+		align-items: center;
+		justify-content: center;
+	}
+
+	.vw-hint-text {
+		font-size: 13rpx;
+		color: #5A5B5C;
+	}
+
+	/* 左右切换热区：必须压在双缓冲图片之上（z-index 4），否则点不到 */
+	.vw-side {
+		position: absolute;
+		top: 0;
+		width: 70rpx;
+		height: 100%;
+		z-index: 4;
+		align-items: center;
+		justify-content: center;
+	}
+
+	.vw-side-left {
+		left: 0;
+	}
+
+	.vw-side-right {
+		right: 0;
+	}
+
+	.vw-side-text {
+		font-size: 30rpx;
+		color: #8A8B90;
+	}
+</style>

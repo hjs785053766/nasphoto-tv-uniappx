@@ -1,0 +1,1040 @@
+<template>
+	<view class="page">
+		<!-- 全局导航栏：搜索页照样显示（与首页 / 图库 / 相册 / 设置共用），
+		     `search-active` 让右侧「搜索」按钮保持蓝底选中态，表示当前就在搜索 -->
+		<NavBar
+			:active="-1"
+			:focus-index="navIndex"
+			:show-search="true"
+			:show-settings="true"
+			:show-clock="true"
+			:settings-active="false"
+			:search-active="true"
+			@nav="onNavClick"
+			@search="onFocusInput"
+			@settings="onOpenSettings"
+		/>
+		<!-- 导航栏不占布局高度，用等高空白撑出间距 -->
+		<view class="nav-spacer"></view>
+
+		<!-- 搜索框：导航栏下方一条**深色半透明**胶囊（与导航栏的胶囊同一套配色，
+		     不用白底，否则跟其它页面完全不是一套 UI）。
+		     只保留「放大镜 + 输入 + ×」：截图里左「AI 星标」、右「AI 搜索胶囊 / 筛选」都不要；
+		     × 有内容先清空、没内容才关闭；返回键无论有没有内容都直接关闭 -->
+		<view class="bar-wrap">
+			<view class="bar" :class="barClass()">
+				<!-- 放大镜保持灰描边，不跟随选中变色（只有一个描边表示焦点就够了） -->
+				<view class="ico-search">
+					<view class="ico-search-ring"></view>
+					<view class="ico-search-handle"></view>
+				</view>
+				<input
+					class="bar-input"
+					v-model="keyword"
+					:focus="inputFocus"
+					confirm-type="search"
+					placeholder="搜索照片、视频、场景"
+					placeholder-style="color:#5A5B5C;font-size:13rpx"
+					@confirm="onConfirm"
+				/>
+				<!-- 删除 / 关闭按钮：遥控器按右键选中它，OK 清空内容、无内容时关闭搜索。
+				     字符用「×」（U+00D7）：电视系统字体里都有；
+				     以前用的「✕」（U+2715）在小米电视字体里缺字形，圆圈里是空的（用户报「没图标」） -->
+				<view class="bar-clear" :class="clearClass()" @click="onClearOrClose">
+					<text class="bar-clear-text">×</text>
+				</view>
+			</view>
+		</view>
+
+		<!-- 状态行：结果数 / 错误提示 -->
+		<view class="topbar">
+			<text class="tb-sub">{{ statusText }}</text>
+			<text class="tb-error" v-if="errorText.length > 0">{{ errorText }}</text>
+		</view>
+
+		<!-- 结果：一排 8 个正方形缩略图，左下角标区分 视频（带时长）/ 实况 -->
+		<scroll-view
+			class="body"
+			direction="vertical"
+			:scroll-top="scrollTop"
+			:show-scrollbar="false"
+			:lower-threshold="400"
+			@scroll="onScroll"
+			@scrolltolower="onLower"
+		>
+			<!-- 只渲染 visible（results 的前 shownCount 张）：几千条结果一次性挂全会卡住几秒，
+			     滚到底 / 按下键时再追加一批（RENDER_CHUNK = 8 列 × 10 行） -->
+			<view class="cells">
+				<view
+					class="cell"
+					:class="cellClass(i)"
+					:style="cellStyle"
+					v-for="(cv, i) in visible"
+					:key="cv.photo.id + '-' + i"
+					@click="openViewer(i)"
+				>
+					<LazyThumb :path="cv.photo.thumb" :active="i >= winLo && i <= winHi" />
+					<view class="cell-tag" v-if="cv.photo.cat == 'video'">
+						<text class="cell-tag-icon">▶</text>
+						<text class="cell-tag-text">{{ cv.tag }}</text>
+					</view>
+					<view class="cell-tag" v-if="cv.live">
+						<view class="live-ring">
+							<view class="live-core"></view>
+						</view>
+						<text class="cell-tag-text">实况</text>
+					</view>
+				</view>
+			</view>
+
+			<!-- 还有没渲染出来的：滚到这里自动再挂一批，不至于「滚不动」 -->
+			<view class="more" v-if="hasMore">
+				<text class="more-text">已显示 {{ visible.length }} / {{ results.length }} 张，继续下滑加载…</text>
+			</view>
+
+			<view class="empty" v-if="!loading && results.length == 0 && emptyText.length > 0">
+				<text class="empty-text">{{ emptyText }}</text>
+			</view>
+		</scroll-view>
+
+		<!-- 查看器：图片 / 视频 / 实况与图库、相册内页共用同一个组件 -->
+		<PhotoViewer
+			v-if="viewerOpen"
+			:photos="results"
+			:index="viewerIndex"
+			:canPrev="viewerIndex > 0"
+			:canNext="viewerIndex + 1 < results.length"
+			@close="onViewerClose"
+			@nav="onViewerNav"
+		/>
+	</view>
+</template>
+
+<script setup lang="uts">
+	import { search, logout, startTvKeyHook, stopTvKeyHook } from '@/uni_modules/fnos-auth'
+	import { PhotoItem, videoTagText, showLiveTag } from '@/common/photo.uts'
+	import { KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_OK, KEY_ENTER, KEY_BACK, dispatchKey } from '@/common/keys.uts'
+	import LazyThumb from '@/components/LazyThumb.uvue'
+	import PhotoViewer from '@/components/PhotoViewer.uvue'
+	import NavBar from '@/components/NavBar.uvue'
+
+	/** 一排张数：按需求固定 8 个 */
+	const COLS = 8
+	/** 网格可用宽度（rpx）= 750 − 页面左右边距 12 */
+	const GRID_WIDTH_RPX = 738
+	/** 单元格四周外边距之和（2rpx × 2） */
+	const CELL_MARGIN_RPX = 4
+	/**
+	 * 每批渲染的张数（8 列 × 10 行）。
+	 * 搜索结果动辄几千张（实测「上海」3053 张），一次性挂 3000 多个格子会卡住好几秒，
+	 * 每个格子还会立刻去下载缩略图；所以先只渲染一批，滚动到底再追加一批。
+	 */
+	const RENDER_CHUNK = 80
+
+	/**
+	 * 网格里的一格：photo 是原结果项，`tag` / `live` 是角标用的**预计算结果**。
+	 * 模板里直接调 `common/photo.uts` 的导入函数会被编译成 `unref(fn)(...)`，
+	 * Kotlin 侧报「找不到名称 invoke」（见 AGENTS 5.2）。
+	 */
+	type CellView = {
+		photo: PhotoItem
+		tag: string
+		live: boolean
+	}
+
+	const keyword = ref('')
+	const results = ref<Array<PhotoItem>>([])
+	const loading = ref(false)
+	const errorText = ref('')
+	/** 是否已经搜过（区分「还没搜」和「搜了但 0 条」） */
+	const searched = ref(false)
+	const scrollTop = ref(0)
+	/**
+	 * 输入框是否持有焦点：按下键进网格时置 false，从网格最上一行再按上键恢复。
+	 *
+	 * 初值 false（不首帧弹键盘）：正常进来时 onLoad 会主动 showKeyboard()；
+	 * 从首页「场景」进来时是来看照片的，焦点直接落在结果网格上（见 consumeSceneKeyword）。
+	 */
+	const inputFocus = ref(false)
+	/**
+	 * 搜索条内部焦点：0 = 输入框，1 = 右侧的「✕」。
+	 * 遥控器在输入框里按右键可以选中「✕」（以前 ✕ 只能用鼠标点，
+	 * 电视上根本没法规遥控器删除内容）。
+	 */
+	const barFocus = ref(0)
+	/**
+	 * 导航栏遥控器焦点（-1 = 不在导航栏）。
+	 * 搜索页的返回键**先把焦点交给导航栏**，导航栏里再按返回才关掉搜索（用户口径 2026-11-22）。
+	 */
+	const navIndex = ref(-1)
+	/** 导航栏可聚焦入口个数：0 首页 / 1 图库 / 2 相册 / 3 搜索 / 4 设置 */
+	const NAV_COUNT = 5
+	/** 网格焦点是否可见（按过方向键才画蓝框） */
+	const focusVisible = ref(false)
+	const gridIndex = ref(0)
+	/** 当前已经挂到 DOM 上的张数（分批渲染的游标） */
+	const shownCount = ref(0)
+
+	/**
+	 * 缩略图渲染窗口：只让光标附近的格子持有位图。
+	 *
+	 * 搜索结果会一批一批往 DOM 里加（RENDER_CHUNK = 80），翻得越深挂得越多，
+	 * 每张缩略图 ~360KB 常驻内存 → 越翻越卡（真机实测相册内页翻 360 张就到 221MB）。
+	 * 这里不动渲染数量（布局不变），只控制「谁去下载/保留位图」。
+	 */
+	const WIN_ROWS_ABOVE = 8
+	const WIN_ROWS_BELOW = 10
+	const winLo = computed((): number => {
+		const lo = gridIndex.value - WIN_ROWS_ABOVE * COLS
+		return lo < 0 ? 0 : lo
+	})
+	const winHi = computed((): number => {
+		return gridIndex.value + WIN_ROWS_BELOW * COLS
+	})
+
+	const viewerOpen = ref(false)
+	const viewerIndex = ref(0)
+
+	let keyHook = 0
+	let unit = 1.0
+	let viewportPx = 0.0
+	/** 一行格子的高度（px，含外边距），遥控器上下移动时滚动跟随用 */
+	let cellPx = 0.0
+	let currentScroll = 0.0
+	/** 每次清空 / 重新搜索 +1：丢弃上一次迟到的回包 */
+	let searchSeq = 0
+	let redirecting = false
+	/** 上次「鉴权失败」的时间戳：用于区分冷启动假 401 与真的登录态失效 */
+	let authFailAt = 0
+
+	/** 单格边长（rpx）：把可用宽度均分给 8 列，再减去外边距 */
+	function cellSizeRpx(): number {
+		return Math.floor(GRID_WIDTH_RPX / COLS) - CELL_MARGIN_RPX
+	}
+
+	const cellStyle = computed((): string => {
+		const s = cellSizeRpx()
+		return 'width:' + s.toString() + 'rpx;height:' + s.toString() + 'rpx;'
+	})
+
+	/**
+	 * 真正参与渲染的那一段（前缀切片，顺便把角标文案算好）：
+	 * results 仍是完整结果，给查看器左右翻页用；模板只吃这个 CellView 数组。
+	 */
+	const visible = computed((): Array<CellView> => {
+		const all = results.value
+		const n = shownCount.value
+		const out: Array<CellView> = []
+		if (n <= 0) {
+			return out
+		}
+		const end = n >= all.length ? all.length : n
+		for (let i = 0; i < end; i++) {
+			const p = all[i]
+			out.push({ photo: p, tag: videoTagText(p), live: showLiveTag(p) } as CellView)
+		}
+		return out
+	})
+
+	/** 还有没渲染出来的（滚到底 / 按下键时再追加一批） */
+	const hasMore = computed((): boolean => {
+		return shownCount.value < results.value.length
+	})
+
+	const statusText = computed((): string => {
+		if (loading.value) {
+			return '正在搜索…'
+		}
+		const kw = keyword.value.trim()
+		if (kw.length == 0) {
+			return '按 OK 唤起键盘输入关键词，键盘上点「搜索」开始'
+		}
+		if (results.value.length > 0) {
+			return '找到 ' + results.value.length.toString() + ' 张'
+		}
+		if (searched.value) {
+			return '没有找到相关内容'
+		}
+		return '按 OK 唤起键盘，键盘上点「搜索」开始'
+	})
+
+	/**
+	 * 空白提示：只在「搜了但没结果 / 出错」时显示。
+	 * 刚进页面（还没输入）留空即可 —— 状态行已经有一句「输入关键词…」，
+	 * 中间再放一段同样的话是重复，看着很杂。
+	 */
+	const emptyText = computed((): string => {
+		if (errorText.value.length > 0) {
+			return errorText.value
+		}
+		if (loading.value) {
+			return ''
+		}
+		if (keyword.value.trim().length == 0) {
+			return ''
+		}
+		return '没有找到相关照片'
+	})
+
+	/** 鉴权类错误：token 失效 / 未授权，需要重新登录 */
+	function isAuthError(msg: string): boolean {
+		return msg.indexOf('401') >= 0 ||
+			msg.indexOf('5001') >= 0 ||
+			msg.indexOf('未授权') >= 0 ||
+			msg.indexOf('鉴权') >= 0 ||
+			msg.indexOf('token') >= 0 ||
+			msg.indexOf('Token') >= 0
+	}
+
+	/** token 过期回登录页（与图库页一致：不置 skipAuto，让登录页用保存的凭据自动重登） */
+	function redirectToLogin() {
+		if (redirecting) {
+			return
+		}
+		// 冷启动 / 重新进 App 的第一次请求可能还没带上 token，那一下 401 是假的：
+		// 直接跳登录页会出现「闪一下登录页又回首页」。5 秒内第一次只报错，再来一次才跳。
+		const now = Date.now()
+		if (now - authFailAt > 5000) {
+			authFailAt = now
+			return
+		}
+		redirecting = true
+		stopTvKeyHook(keyHook)
+		logout()
+		uni.reLaunch({ url: '/pages/index/index' })
+	}
+
+	function failWith(msg: string) {
+		errorText.value = msg
+		if (isAuthError(msg)) {
+			redirectToLogin()
+		}
+	}
+
+	/**
+	 * 重新聚焦输入框并唤起系统键盘（被 onLoad / onClearOrClose / onInputKey / onFocusInput 调用，
+	 * 所以必须定义在这些函数之前 —— UTS 编译成 Kotlin 局部函数，不支持提升）。
+	 *
+	 * `:focus` 是单向 prop：值已经是 true 时再赋 true 不会让系统重新弹键盘，
+	 * 所以先置 false、下一帧再置 true。用户按 OK 时（哪怕框里已经有字）
+	 * 也能把键盘叫出来改关键字（用户反馈「按 OK 不弹键盘」）。
+	 */
+	function showKeyboard() {
+		barFocus.value = 0
+		inputFocus.value = false
+		setTimeout(() => {
+			inputFocus.value = true
+		}, 30)
+	}
+
+	/** 执行搜索（空关键字直接回初始态，不发请求） */
+	async function runSearch() {
+		const kw = keyword.value.trim()
+		searchSeq = searchSeq + 1
+		const seq = searchSeq
+		errorText.value = ''
+		if (kw.length == 0) {
+			results.value = []
+			shownCount.value = 0
+			searched.value = false
+			loading.value = false
+			return
+		}
+		loading.value = true
+		try {
+			const res = await search(kw)
+			if (seq != searchSeq) {
+				return
+			}
+			if (!res.ok) {
+				results.value = []
+				shownCount.value = 0
+				searched.value = true
+				failWith(res.error.length > 0 ? res.error : '搜索失败')
+				return
+			}
+			const list: Array<PhotoItem> = []
+			for (let i = 0; i < res.items.length; i++) {
+				const it = res.items[i]
+				list.push({
+					id: it.id,
+					dt: it.dt,
+					cat: it.cat,
+					w: it.w,
+					h: it.h,
+					live: it.live,
+					thumb: it.thumb,
+					medium: it.medium,
+					original: it.original,
+					name: it.name,
+					video: it.video,
+					duration: it.duration
+				} as PhotoItem)
+			}
+			results.value = list
+			searched.value = true
+			gridIndex.value = 0
+			// 焦点还在输入框时不要给网格画框（两个框容易看错）；
+			// 从场景入口进来（inputFocus 已是 false）时直接把框落在第一张上
+			focusVisible.value = !inputFocus.value
+			scrollTop.value = 0
+			currentScroll = 0.0
+			// 只先挂第一批：几千条结果一次性渲染会卡住几秒（见 RENDER_CHUNK）
+			shownCount.value = list.length > RENDER_CHUNK ? RENDER_CHUNK : list.length
+		} catch (e) {
+			if (seq == searchSeq) {
+				results.value = []
+				shownCount.value = 0
+				searched.value = true
+				failWith((e as Error).message)
+			}
+		} finally {
+			if (seq == searchSeq) {
+				loading.value = false
+			}
+		}
+	}
+
+	function onConfirm() {
+		runSearch()
+	}
+
+	/** 关闭搜索框：一律回进入前的页面（返回键走同一条）。定义在前：UTS 不支持函数提升 */
+	function closeSearch() {
+		stopTvKeyHook(keyHook)
+		// 离开搜索就不再是「首页场景」上下文了，清掉标记，避免后续页面莫名回首页
+		uni.removeStorageSync('fnos.scene.ret')
+		uni.navigateBack({})
+	}
+
+	/** × ：有内容先清空（留在搜索框），没内容才关闭搜索框 */
+	function onClearOrClose() {
+		if (keyword.value.length > 0) {
+			keyword.value = ''
+			searchSeq = searchSeq + 1
+			results.value = []
+			shownCount.value = 0
+			errorText.value = ''
+			searched.value = false
+			loading.value = false
+			showKeyboard()
+			return
+		}
+		closeSearch()
+	}
+
+	/**
+	 * 导航栏分区：0 = 首页（reLaunch 回大屏），1 = 图库 / 2 = 相册。
+	 * 与图库页同一套跳法（内容页之间用 redirectTo 顶掉本页，栈里不留重复实例）。
+	 */
+	function onNavClick(i: number) {
+		if (i == 0) {
+			stopTvKeyHook(keyHook)
+			uni.reLaunch({ url: '/pages/home/home' })
+		} else if (i == 1) {
+			stopTvKeyHook(keyHook)
+			uni.redirectTo({ url: '/pages/library/library' })
+		} else if (i == 2) {
+			stopTvKeyHook(keyHook)
+			uni.redirectTo({ url: '/pages/album/album' })
+		}
+	}
+
+	/** 导航栏「搜索」：已经在本页，重新聚焦输入框（便于接着改关键字） */
+	function onFocusInput() {
+		showKeyboard()
+	}
+
+	/** 导航栏「设置」：进设置页（返回键回搜索页，关键字与结果都还在） */
+	function onOpenSettings() {
+		stopTvKeyHook(keyHook)
+		uni.navigateTo({ url: '/pages/settings/settings' })
+	}
+
+	function onScroll(e: UniScrollEvent) {
+		currentScroll = e.detail.scrollTop
+	}
+
+	/** 再挂一批格子（每次 RENDER_CHUNK 张）；已经全部挂完就什么都不做 */
+	function appendChunk() {
+		const total = results.value.length
+		if (shownCount.value >= total) {
+			return
+		}
+		const next = shownCount.value + RENDER_CHUNK
+		shownCount.value = next > total ? total : next
+	}
+
+	/** 滚到底 / 接近底：追加一批（增量渲染的驱动点） */
+	function onLower() {
+		appendChunk()
+	}
+
+	/** 定位到指定滚动位置（绑定值相同时先挪 1px，否则不会触发滚动） */
+	function applyScrollTop(v: number) {
+		const target = v < 0.0 ? 0.0 : v
+		if (target == scrollTop.value) {
+			scrollTop.value = target + 1.0
+			Promise.resolve().then(() => {
+				scrollTop.value = target
+				currentScroll = target
+			})
+		} else {
+			scrollTop.value = target
+			currentScroll = target
+		}
+	}
+
+	/** 把第 i 张所在行滚进视口 */
+	function ensureVisible(i: number) {
+		const row = Math.floor(i / COLS)
+		const top = row * cellPx
+		const bottom = top + cellPx
+		if (top < currentScroll) {
+			applyScrollTop(top)
+		} else if (bottom > currentScroll + viewportPx) {
+			applyScrollTop(bottom - viewportPx)
+		}
+	}
+
+	function cellClass(i: number): string {
+		return (focusVisible.value && i == gridIndex.value && navIndex.value < 0) ? 'cell-focus' : ''
+	}
+
+	/** 搜索框：输入框持有焦点时加蓝描边（焦点跑进导航栏时不再高亮，避免两处都像焦点） */
+	function barClass(): string {
+		return (inputFocus.value && barFocus.value == 0 && navIndex.value < 0) ? 'bar-focus' : ''
+	}
+
+	/** 「✕」的焦点框：遥控器停在它上面时蓝底 + 白描边 */
+	function clearClass(): string {
+		return (inputFocus.value && barFocus.value == 1 && navIndex.value < 0) ? 'bar-clear-focus' : ''
+	}
+
+	function openViewer(i: number) {
+		if (i < 0 || i >= results.value.length) {
+			return
+		}
+		focusVisible.value = false
+		navIndex.value = -1
+		viewerIndex.value = i
+		viewerOpen.value = true
+	}
+
+	function onViewerNav(delta: number) {
+		const next = viewerIndex.value + delta
+		if (next >= 0 && next < results.value.length) {
+			viewerIndex.value = next
+		}
+	}
+
+	/**
+	 * 层「search.back」：**先把焦点交给导航栏**，导航栏里再按返回才关掉搜索
+	 * （用户口径 2026-11-22：以前一按返回就整页退掉，像「直接回首页」）。
+	 */
+	function onBackKey(code: number): boolean {
+		if (code == KEY_BACK) {
+			navIndex.value = 3
+			return true
+		}
+		return false
+	}
+
+	/** 跳到导航栏第 i 个入口（0 首页 / 1 图库 / 2 相册 / 3 搜索 / 4 设置） */
+	function gotoNav(i: number) {
+		navIndex.value = -1
+		if (i == 3) {
+			// 当前就在搜索：把焦点交回输入框（便于接着改关键字）
+			inputFocus.value = true
+			barFocus.value = 0
+			showKeyboard()
+		} else if (i == 4) {
+			onOpenSettings()
+		} else if (i == 0 || i == 1 || i == 2) {
+			onNavClick(i)
+		}
+	}
+
+	/** 层「search.nav」：导航栏焦点（栈顶）。返回键在这里 = 关掉搜索、回进入前的页面 */
+	function onNavKey(code: number): boolean {
+		if (code == KEY_LEFT) {
+			navIndex.value = (navIndex.value + NAV_COUNT - 1) % NAV_COUNT
+		} else if (code == KEY_RIGHT) {
+			navIndex.value = (navIndex.value + 1) % NAV_COUNT
+		} else if (code == KEY_OK || code == KEY_ENTER) {
+			gotoNav(navIndex.value)
+		} else if (code == KEY_DOWN) {
+			navIndex.value = -1
+			inputFocus.value = true
+			barFocus.value = 0
+		} else if (code == KEY_BACK) {
+			navIndex.value = -1
+			closeSearch()
+		}
+		return true
+	}
+
+	/**
+	 * 层「search.input」：输入框有焦点（覆盖层，吞掉所有键）。
+	 *
+	 * OK / 回车 = **唤起系统键盘**（不是直接搜）：电视上打字本来就靠这个键盘，
+	 * 直接搜会让「想改关键字」变成「又搜一遍」；真正发起搜索是键盘上的「搜索」键（@confirm）。
+	 */
+	function onInputKey(code: number): boolean {
+		const n = visible.value.length
+		if (code == KEY_BACK) {
+			// 交给栈顶的「search.back」（返回键先回导航栏），这里不能吃掉
+			return false
+		}
+		if (code == KEY_RIGHT) {
+			// 右键选中「✕」（遥控器删除关键字 / 关闭搜索；以前只能用鼠标点）
+			barFocus.value = 1
+		} else if (code == KEY_UP) {
+			// 上键把焦点交给导航栏
+			navIndex.value = 3
+		} else if (code == KEY_DOWN) {
+			if (n > 0) {
+				inputFocus.value = false
+				barFocus.value = 0
+				gridIndex.value = 0
+				focusVisible.value = true
+				ensureVisible(0)
+			}
+		} else if (code == KEY_OK || code == KEY_ENTER) {
+			showKeyboard()
+		}
+		return true
+	}
+
+	/** 层「search.clear」：搜索条右侧的「✕」持有焦点（覆盖层） */
+	function onClearKey(code: number): boolean {
+		if (code == KEY_BACK) {
+			return false
+		}
+		if (code == KEY_LEFT) {
+			barFocus.value = 0
+		} else if (code == KEY_OK || code == KEY_ENTER) {
+			// 有内容先清空（回到输入框），没内容才关闭搜索
+			const hasText = keyword.value.length > 0
+			onClearOrClose()
+			if (hasText) {
+				barFocus.value = 0
+			}
+		} else if (code == KEY_UP) {
+			navIndex.value = 3
+		} else if (code == KEY_DOWN) {
+			const n = visible.value.length
+			if (n > 0) {
+				inputFocus.value = false
+				barFocus.value = 0
+				gridIndex.value = 0
+				focusVisible.value = true
+				ensureVisible(0)
+			}
+		}
+		return true
+	}
+
+	/** 层「search.grid」：结果网格（覆盖层，吞掉除返回外的键） */
+	function onGridKey(code: number): boolean {
+		if (code == KEY_BACK) {
+			// 交给 search.back（返回先回导航栏）
+			return false
+		}
+		// 焦点在「已渲染」的格子里移动；再往下就先把下一批挂上（增量渲染）
+		const n = visible.value.length
+		if (n == 0) {
+			if (code == KEY_UP) {
+				inputFocus.value = true
+			}
+			return true
+		}
+		const cur = gridIndex.value
+		const col = cur % COLS
+		let next = cur
+		if (code == KEY_LEFT) {
+			if (col > 0) {
+				next = cur - 1
+			}
+		} else if (code == KEY_RIGHT) {
+			if (col < COLS - 1 && cur + 1 < n) {
+				next = cur + 1
+			}
+		} else if (code == KEY_UP) {
+			if (cur - COLS < 0) {
+				// 已经在第一行：回输入框继续改关键字
+				inputFocus.value = true
+				focusVisible.value = false
+				return true
+			}
+			next = cur - COLS
+		} else if (code == KEY_DOWN) {
+			if (cur + COLS < n) {
+				next = cur + COLS
+			} else if (hasMore.value) {
+				// 已经在最后一行：先挂下一批，焦点顺势往下走（挂上后该下标就存在了）
+				appendChunk()
+				next = cur + COLS
+			}
+		} else if (code == KEY_OK || code == KEY_ENTER) {
+			openViewer(cur)
+			return true
+		} else {
+			return true
+		}
+		gridIndex.value = next
+		focusVisible.value = true
+		ensureVisible(next)
+		return true
+	}
+
+	/** 层名 → 处理函数（UTS 不能把函数放进容器，所以用名字查表） */
+	function runKeyLayer(layer: string, code: number): boolean {
+		if (layer == 'search.nav') {
+			return onNavKey(code)
+		}
+		if (layer == 'search.back') {
+			return onBackKey(code)
+		}
+		if (layer == 'search.clear') {
+			return onClearKey(code)
+		}
+		if (layer == 'search.input') {
+			return onInputKey(code)
+		}
+		if (layer == 'search.grid') {
+			return onGridKey(code)
+		}
+		return false
+	}
+
+	/**
+	 * 遥控器入口（T5 分发层）。
+	 * 层序（底 → 顶）：网格 / 输入框 / ✕ → 「返回先给导航栏」→ 导航栏焦点。
+	 * 查看器打开期间按键由 PhotoViewer 独占通道，这里不重复处理。
+	 */
+	function handleKey(code: number) {
+		if (viewerOpen.value) {
+			// 正常情况下查看器独占通道，这里收不到键；真收到（查看器还没订阅上的几十毫秒）
+			// 就整个吃掉：**不能**把返回键当「关闭搜索」，否则会出现
+			// 「进照片按返回 → 直接退出搜索」（系统层的二次返回已在 FnOsTvKeys 里堵住）
+			return
+		}
+		const stack: Array<string> = []
+		if (inputFocus.value) {
+			if (barFocus.value == 1) {
+				stack.push('search.clear')
+			} else {
+				stack.push('search.input')
+			}
+		} else {
+			stack.push('search.grid')
+		}
+		stack.push('search.back')
+		if (navIndex.value >= 0) {
+			stack.push('search.nav')
+		}
+		dispatchKey(code, stack, (layer: string, c: number): boolean => {
+			return runKeyLayer(layer, c)
+		})
+	}
+
+	/** 订阅遥控器按键（定义在 handleKey 之后：UTS 不支持函数提升） */
+	function armKeyHook() {
+		keyHook = startTvKeyHook((code: number) => {
+			handleKey(code)
+		})
+	}
+
+	/**
+	 * 组件关掉后：收回按键通道，**并把网格焦点框恢复出来**。
+	 * openViewer 会临时把 focusVisible 置 false（查看器里不该有网格框），
+	 * 以前关闭后没恢复，回来看结果就「没有光标」了。
+	 */
+	function onViewerClose() {
+		viewerOpen.value = false
+		focusVisible.value = true
+		armKeyHook()
+	}
+
+	/**
+	 * 场景入口（`/pages/search/search?from=scene`）：
+	 * 首页把场景名写进 storage 再跳过来，这里读走即删并直接搜。
+	 * 见 pages/home 的 enterScene 与 AGENTS 5.23（场景列表接口还没确认）。
+	 */
+	function consumeSceneKeyword(options: OnLoadOptions): boolean {
+		const from = options['from']
+		if (from == null || from.toString() != 'scene') {
+			return false
+		}
+		const raw = uni.getStorageSync('fnos.scene.keyword')
+		uni.removeStorageSync('fnos.scene.keyword')
+		if (raw == null) {
+			return false
+		}
+		const name = raw.toString()
+		if (name.length == 0) {
+			return false
+		}
+		keyword.value = name
+		// 「场景」上下文里，从搜索再去设置 / 相册，返回应该**直接回首页**而不是退回本页
+		// （用户口径 2026-11-24）。标记由设置页消费，搜索页关闭时清掉。
+		uni.setStorageSync('fnos.scene.ret', 'home')
+		// 自动搜一次，焦点直接落在结果网格（不弹键盘，用户是来「看场景照片」的）
+		inputFocus.value = false
+		runSearch()
+		return true
+	}
+
+	onLoad((options: OnLoadOptions) => {
+		const info = uni.getWindowInfo()
+		unit = info.windowWidth / 750.0
+		cellPx = (cellSizeRpx() + CELL_MARGIN_RPX) * unit
+		// 导航栏 60 + 间距 8 + 搜索条 60 + 间距 8 + 状态行 22 + 间距 8
+		// + 页面上下内边距 12 + 网格底部 8 ≈ 186rpx（改上面任一高度必须同步这里）
+		viewportPx = info.windowHeight - 186.0 * unit
+		armKeyHook()
+		if (!consumeSceneKeyword(options)) {
+			// 正常进搜索页：直接把键盘叫出来（电视上要打字只能靠它）
+			showKeyboard()
+		}
+	})
+
+	onShow(() => {
+		// 从设置 / 其它页回来：焦点回到搜索框，导航栏不持有焦点
+		navIndex.value = -1
+		barFocus.value = 0
+		armKeyHook()
+	})
+
+	onUnload(() => {
+		stopTvKeyHook(keyHook)
+	})
+</script>
+
+<style>
+	.page {
+		flex: 1;
+		position: relative;
+		background-color: #141418;
+		padding: 6rpx;
+	}
+
+	/* 导航栏悬浮、不占布局高度：用等高占位补回顶部间距（与其他页一致） */
+	.nav-spacer {
+		height: 60rpx;
+		margin-bottom: 8rpx;
+	}
+
+	/* ---------------- 搜索条 ---------------- */
+
+	/* 导航栏下方的一条高度带（60rpx + 8rpx 间距）：与导航栏同一节奏，不额外占高 */
+	.bar-wrap {
+		height: 60rpx;
+		flex-direction: row;
+		align-items: center;
+		margin-bottom: 8rpx;
+	}
+
+	/* 深色半透明胶囊：配色与导航栏的 `.brand` / `.act` 完全一致，
+	   宽度铺满、高度只比导航栏按钮略高（34rpx），不用白底（白底和深色页面不是一套 UI） */
+	.bar {
+		flex: 1;
+		height: 34rpx;
+		flex-direction: row;
+		align-items: center;
+		padding-left: 12rpx;
+		padding-right: 4rpx;
+		border-radius: 17rpx;
+		background-color: rgba(255, 255, 255, 0.08);
+		border-width: 1rpx;
+		border-style: solid;
+		border-color: rgba(255, 255, 255, 0.14);
+	}
+
+	/* 输入中：蓝描边（与分区选中 / 每行张数档位同一套强调色） */
+	.bar-focus {
+		border-color: #3388FF;
+	}
+
+	/* 放大镜：与导航栏里的搜索图标同一套几何（圆环 + 45° 手柄） */
+	.ico-search {
+		width: 12rpx;
+		height: 12rpx;
+		position: relative;
+	}
+
+	/* 圆环：**只给描边**，绝对不要给 background-color，否则会变成实心圆块 */
+	.ico-search-ring {
+		position: absolute;
+		left: 0;
+		top: 0;
+		width: 9rpx;
+		height: 9rpx;
+		border-width: 2rpx;
+		border-style: solid;
+		border-color: #7F858F;
+		border-radius: 5rpx;
+	}
+
+	.ico-search-handle {
+		position: absolute;
+		left: 7rpx;
+		top: 7rpx;
+		width: 2rpx;
+		height: 5rpx;
+		border-radius: 1rpx;
+		background-color: #7F858F;
+		transform: rotate(-45deg);
+		transform-origin: 50% 50%;
+	}
+
+	.bar-input {
+		flex: 1;
+		height: 34rpx;
+		font-size: 13rpx;
+		color: #FFFFFF;
+		margin-left: 8rpx;
+	}
+
+	/* × 圆形按钮：有内容先删内容，没内容才关闭 */
+	.bar-clear {
+		width: 26rpx;
+		height: 26rpx;
+		border-radius: 13rpx;
+		align-items: center;
+		justify-content: center;
+		background-color: rgba(255, 255, 255, 0.14);
+	}
+
+	/* 遥控器把焦点停在「✕」上：蓝底 + 白字（电视上只改描边根本看不见） */
+	.bar-clear-focus {
+		background-color: #3388FF;
+		border-width: 2rpx;
+		border-style: solid;
+		border-color: #FFFFFF;
+	}
+
+	/* 「×」比原来的「✕」略小，字号加大一号才和圆圈相称 */
+	.bar-clear-text {
+		font-size: 16rpx;
+		font-weight: bold;
+		color: #E6E7E8;
+	}
+
+	/* ---------------- 状态行 ---------------- */
+
+	.topbar {
+		height: 22rpx;
+		flex-direction: row;
+		align-items: center;
+		margin-bottom: 8rpx;
+	}
+
+	.tb-sub {
+		font-size: 12rpx;
+		color: #7C7D7F;
+	}
+
+	.tb-error {
+		font-size: 11rpx;
+		color: #E26052;
+		margin-left: 8rpx;
+	}
+
+	/* ---------------- 结果网格 ---------------- */
+
+	.body {
+		flex: 1;
+		padding-bottom: 8rpx;
+	}
+
+	.cells {
+		flex-direction: row;
+		flex-wrap: wrap;
+	}
+
+	/* 正方形格子；宽高由 cellStyle 按 8 列动态给出，这里只管外观 */
+	.cell {
+		position: relative;
+		margin: 2rpx;
+		border-radius: 8rpx;
+		background-color: #232328;
+		overflow: hidden;
+	}
+
+	/* 遥控器焦点：蓝色描边（与相册卡片 / 时间轴同一套） */
+	.cell-focus {
+		border-width: 2rpx;
+		border-style: solid;
+		border-color: #5B9CFF;
+	}
+
+	/* 类型角标：与图库 / 相册内页一致（8 列格子约 88rpx，角标仍在格内） */
+	.cell-tag {
+		position: absolute;
+		left: 4rpx;
+		bottom: 4rpx;
+		height: 13rpx;
+		flex-direction: row;
+		align-items: center;
+		padding-left: 3rpx;
+		padding-right: 4rpx;
+		border-radius: 4rpx;
+		background-color: rgba(0, 0, 0, 0.55);
+	}
+
+	.cell-tag-icon {
+		font-size: 7rpx;
+		color: #FFFFFF;
+		margin-right: 2rpx;
+	}
+
+	.cell-tag-text {
+		font-size: 8rpx;
+		color: #FFFFFF;
+	}
+
+	/* 实况照片的同心圆图标（纯 view 拼） */
+	.live-ring {
+		width: 8rpx;
+		height: 8rpx;
+		border-radius: 4rpx;
+		border-width: 1rpx;
+		border-style: solid;
+		border-color: #FFFFFF;
+		align-items: center;
+		justify-content: center;
+		margin-right: 2rpx;
+	}
+
+	.live-core {
+		width: 3rpx;
+		height: 3rpx;
+		border-radius: 2rpx;
+		background-color: #FFFFFF;
+	}
+
+	/* 增量渲染的提示行：滚到这里就再挂一批 */
+	.more {
+		height: 40rpx;
+		align-items: center;
+		justify-content: center;
+	}
+
+	.more-text {
+		font-size: 11rpx;
+		color: #5A5B5C;
+	}
+
+	.empty {
+		height: 200rpx;
+		align-items: center;
+		justify-content: center;
+	}
+
+	.empty-text {
+		font-size: 12rpx;
+		color: #5A5B5C;
+	}
+</style>
