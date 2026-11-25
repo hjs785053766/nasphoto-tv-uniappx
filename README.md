@@ -93,7 +93,7 @@
 
 | 版本 | 范围 | 状态 |
 | --- | --- | --- |
-| **1.0** | 登录 / 两步验证、图库、相册、首页大屏、查看器、视频播放、实况照片、AI 搜索、设置页、遥控器操作（11 项） | ✅ 已实现 |
+| **1.0** | 登录 / 两步验证、图库、相册、首页大屏、查看器、视频播放、实况照片、AI 搜索、设置页、遥控器操作（11 项） | ✅ 已实现，[v1.0.0](https://github.com/hjs785053766/nasphoto-tv-uniappx/releases/tag/v1.0.0) 已发布 |
 | **2.0** | 首页展示内容自定义、主题切换、相册页顶部功能栏、首页托盘缩小、健壮性增强（5 项） | 📋 计划中 |
 | **3.0** | AI 照片评价（1 项） | 📋 计划中 |
 
@@ -153,14 +153,16 @@
 
 ### 4.1 直接安装预编译包
 
-仓库 `apk/` 目录放置了已签名的 release 包（文件名含构建时间），可直接安装到电视盒子：
+已签名的 1.0 安装包发布在 [Releases](https://github.com/hjs785053766/nasphoto-tv-uniappx/releases/latest)：`NasPhotoTV-release-1.0.apk`（约 17.6MB），下载后可直接安装到电视盒子：
 
 ```
 adb connect <TV_IP>:5555
-adb install -r apk\NasPhotoTV-release-<时间>.apk
+adb install -r NasPhotoTV-release-1.0.apk
 ```
 
 安装后从电视桌面（Leanback）或应用列表中打开，填写 NAS 地址、端口、账号、密码即可登录。
+
+> `apk/` 目录不入库（已在 `.gitignore` 中排除），本地自行构建的包放在该目录下即可。
 
 ### 4.2 源码运行
 
@@ -216,7 +218,7 @@ uni_modules/fnos-auth/
 static/                         图标与 logo（app 内使用；web 端同源直出）
 nativeResources/android/        原生清单覆盖（TV Leanback 入口等，云打包 / 自定义基座生效）
 打包脚本/                       Windows 本地离线打包工具（模板 + 一键脚本）
-apk/                            已签名的 release 包
+apk/                            本地打包输出（不入库，发行包见 Releases）
 docs/screenshots/               README 使用的真机界面截图
 
 index.html / main.ts / main.uts / vite.config.js   入口与浏览器调试用 dev 代理
